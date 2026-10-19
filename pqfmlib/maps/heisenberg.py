@@ -18,7 +18,6 @@ from pqfmlib.core.base import BaseProjectiveQFM
 from pqfmlib.core.execution import (
     PreparedProjectedFeatureJob,
     execute_prepared_projected_feature_job,
-    execute_statevector_features,
     reorder_theta_by_parameter_names,
     submit_job_and_save_metadata,
     validate_circuit_parameter_compatibility,
@@ -259,6 +258,7 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
             bool(self.simulation),
             bool(self.fakebackend),
             bool(self.ideal),
+            self.framework,
             self.expectation_method,
             int(self.shots),
             str(self.ibm_qpu),
@@ -374,6 +374,7 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
             self.backend,
             self.estimator,
             simulation=True,
+            framework=self.framework,
             expectation_method=self.expectation_method,
             shots=self.shots,
             base_folder=None,
@@ -476,6 +477,8 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
                         optimization_level=3,
                         seed_transpiler=self.seed,
                     )
+            elif self.framework == "cudaq":
+                qc_t = qc_param.copy()
             else:
                 pm = generate_preset_pass_manager(
                     optimization_level=3,
@@ -520,8 +523,6 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
             obs_isa = obs_list
         obs_isa_broadcast = [[obs] for obs in obs_isa]
 
-        theta_reordered = reorder_theta_by_parameter_names(qc_t, param_order, theta_values_all)
-
         metadata_extra = {
             "q_enc": int(self.q_enc),
             "R": int(self.R),
@@ -535,23 +536,21 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
         if self.phys_nodes is not None:
             metadata_extra["phys_nodes"] = [int(x) for x in self.phys_nodes]
 
-        if self.simulation and self.expectation_method == "statevector":
+        if self.simulation:
             prepared = PreparedProjectedFeatureJob(
                 qc_t, tuple(param_order), obs_isa_broadcast, obs_metadata,
             )
-            self.Xq_all_raw, self.obs_metadata = execute_statevector_features(
-                prepared, theta_values_all, self.backend,
+            self.Xq_all_raw, self.obs_metadata = execute_prepared_projected_feature_job(
+                prepared, theta_values_all, self.backend, self.estimator,
+                framework=self.framework,
+                simulation=True,
+                expectation_method=self.expectation_method,
+                shots=self.shots,
+                base_folder=self.base_folder,
             )
             return None
 
-        if self.simulation:
-            job = self.estimator.run([(qc_t, obs_isa_broadcast, theta_reordered)])
-            result = job.result()[0]
-            evs = np.asarray(result.data.evs, dtype=float)
-            self.Xq_all_raw = evs.T
-            self.obs_metadata = obs_metadata
-            return None
-
+        theta_reordered = reorder_theta_by_parameter_names(qc_t, param_order, theta_values_all)
         self.job_id = submit_job_and_save_metadata(
             self.estimator,
             qc_t,

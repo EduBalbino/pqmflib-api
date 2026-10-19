@@ -12,7 +12,7 @@ from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_sp
 from sklearn.pipeline import Pipeline
 from sklearn.ensemble import GradientBoostingClassifier
 
-NOTEBOOK = Path(__file__).resolve().parents[1] / 'examples' / 'xyz_breast_cancer_shap_pipeline.ipynb'
+NOTEBOOK = Path(__file__).resolve().parents[1] / 'examples' / 'xyz_breast_cancer_pca_pipeline.ipynb'
 
 
 def load_scope():

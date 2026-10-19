@@ -13,6 +13,7 @@ from sklearn.base import BaseEstimator, TransformerMixin
 
 from pqfmlib.core.backend import load_ibm_backend, make_aer_backend, make_estimator
 from pqfmlib.core.data import load_tabular_dataset
+from pqfmlib.core.framework import validate_framework_configuration
 
 
 @dataclass
@@ -28,6 +29,7 @@ class BaseProjectiveQFM(TransformerMixin, BaseEstimator):
     simulation: bool = True
     fakebackend: bool = False
     ideal: bool = True
+    framework: str = field(default="qiskit", kw_only=True)
     expectation_method: str = field(default="shots", kw_only=True)
     shots: int = 4096
     ibm_qpu: str = "ibm_fez"
@@ -56,6 +58,7 @@ class BaseProjectiveQFM(TransformerMixin, BaseEstimator):
         return type(self)(**self.get_params(deep=False))
 
     def __post_init__(self) -> None:
+        self._validate_framework()
         self._validate_expectation_method()
         self._validate_resource_estimation_mode()
         if self.ideal:
@@ -140,7 +143,17 @@ class BaseProjectiveQFM(TransformerMixin, BaseEstimator):
             raise ValueError("DataFrame columns must match the names and order used during fit.")
         return values
 
+    def _validate_framework(self) -> None:
+        validate_framework_configuration(
+            self.framework,
+            simulation=self.simulation,
+            ideal=self.ideal,
+            fakebackend=self.fakebackend,
+        )
+
     def _validate_expectation_method(self) -> None:
+        if self.framework == "cudaq" and self.expectation_method == "exact":
+            return
         if self.expectation_method not in ("shots", "statevector"):
             raise ValueError("expectation_method must be 'shots' or 'statevector'.")
         if self.expectation_method == "statevector":
@@ -159,8 +172,22 @@ class BaseProjectiveQFM(TransformerMixin, BaseEstimator):
         self.num_features = int(self.X.shape[1])
 
     def setup_backend_and_estimator(self) -> None:
+        self._validate_framework()
         self._validate_expectation_method()
         self._validate_resource_estimation_mode()
+        if self.framework == "cudaq":
+            from pqfmlib.core.cudaq_execution import CudaqExecutor
+
+            if self.statevector_device not in (None, "GPU"):
+                raise ValueError("framework='cudaq' requires a GPU; statevector_device must be None or 'GPU'.")
+            self.backend = CudaqExecutor(
+                mps=self.mps,
+                seed=self.seed,
+                mps_max_bond_dimension=self.mps_max_bond_dimension,
+                mps_truncation_threshold=self.mps_truncation_threshold,
+            )
+            self.estimator = None
+            return
         if self.ideal:
             self.backend = self._make_aer_backend()
             self._set_aer_max_qubits()

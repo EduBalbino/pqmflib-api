@@ -82,6 +82,7 @@ def benchmark_heisenberg_cudaq_direct(qfm, X, repeats=3):
     if isinstance(repeats, bool) or not isinstance(repeats, int) or repeats < 1:
         raise ValueError('repeats must be a positive integer.')
     executor = qfm.backend
+    tolerance = 2e-5 if executor.precision == "single" else 1e-10
     cudaq = executor._cudaq
     prepared = qfm._prepared_execution
     setup_started = perf_counter()
@@ -126,7 +127,7 @@ def benchmark_heisenberg_cudaq_direct(qfm, X, repeats=3):
         warmups[name] = perf_counter() - start
         if reference is None:
             reference = result.copy()
-        np.testing.assert_allclose(result, reference, atol=1e-10, rtol=1e-10, equal_nan=False)
+        np.testing.assert_allclose(result, reference, atol=tolerance, rtol=tolerance, equal_nan=False)
     timings = {name: [] for name in paths}
     errors = {name: 0.0 for name in paths}
     for repeat in range(repeats):
@@ -136,13 +137,13 @@ def benchmark_heisenberg_cudaq_direct(qfm, X, repeats=3):
             start = perf_counter()
             result = paths[name]()
             elapsed = perf_counter() - start
-            np.testing.assert_allclose(result, reference, atol=1e-10, rtol=1e-10, equal_nan=False)
+            np.testing.assert_allclose(result, reference, atol=tolerance, rtol=tolerance, equal_nan=False)
             timings[name].append(elapsed)
             errors[name] = max(errors[name], float(np.max(np.abs(result - reference))))
             print(f'{name}: {repeat + 1}/{repeats}: {elapsed:.3f} s', flush=True)
     return pd.DataFrame([
         dict(path=name, q_enc=qfm.q_enc, n_samples=len(X), n_observables=len(observables),
-             repeats=repeats, precision='double', target=executor.target,
+             repeats=repeats, precision=executor.precision, target=executor.target,
              mps_max_bond_dimension=executor.mps_max_bond_dimension,
              mps_truncation_threshold=executor.mps_truncation_threshold,
              warmup_seconds=warmups[name], median_seconds=float(np.median(timings[name])),
@@ -190,9 +191,10 @@ def benchmark_heisenberg_cudaq_shots(qfm, X, repeats=3, *, shots=None,
     theta, _ = make_heisenberg_theta_matrix(
         X, qfm.q_enc, features_per_block=qfm.theta_info['features_per_block'],
         use_tanh_scaling=qfm.use_tanh_scaling)
-    executor = CudaqExecutor(mps=True, seed=qfm.seed,
+    executor = CudaqExecutor(mps=True, seed=qfm.seed, precision=qfm.precision,
                              mps_max_bond_dimension=qfm.mps_max_bond_dimension,
                              mps_truncation_threshold=qfm.mps_truncation_threshold)
+    tolerance = 2e-5 if executor.precision == "single" else 1e-10
     cudaq = executor._cudaq
     # Construct both kernels before timing. The direct kernel bypasses our
     # transpiler and parameter binder; the direct shots lifecycle is deliberately
@@ -287,7 +289,7 @@ def benchmark_heisenberg_cudaq_shots(qfm, X, repeats=3, *, shots=None,
             if reference is None:
                 reference = result.copy()
             if method == 'exact':
-                np.testing.assert_allclose(result, reference, atol=1e-10, rtol=1e-10)
+                np.testing.assert_allclose(result, reference, atol=tolerance, rtol=tolerance)
             if result.shape != reference.shape or not np.isfinite(result).all():
                 raise ValueError('Invalid feature result from diagnostic route.')
             records.append(dict(
@@ -297,7 +299,7 @@ def benchmark_heisenberg_cudaq_shots(qfm, X, repeats=3, *, shots=None,
                 num_blocks=qfm.theta_info['num_blocks'],
                 n_distinct_pauli_terms=len(executor._compiled.observables),
                 shots=shots if method == 'shots' else None, seed=qfm.seed,
-                precision='double', target=executor.target,
+                precision=executor.precision, target=executor.target,
                 mps_max_bond_dimension=executor.mps_max_bond_dimension,
                 mps_truncation_threshold=executor.mps_truncation_threshold,
                 wall_seconds=elapsed, seconds_per_sample=elapsed / len(X),

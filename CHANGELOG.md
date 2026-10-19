@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.4.0
+
+- Added `precision="single"` (FP32) and `precision="double"` (FP64, default)
+  to Heisenberg, CD-Ising and XYZ. Qiskit/Aer statevector on CPU/GPU and CUDA-Q
+  statevector/MPS support both settings. Qiskit MPS rejects FP32 explicitly.
+- Passed precision to compatible Aer fake-backend methods and rejected FP32
+  for unsupported methods and real-QPU execution before backend initialization.
+- Preserved precision through cloning, parameter updates and `run()` exports.
+  Changing precision after fitting requires a new `fit()`. Feature output types,
+  shot counts and MPS truncation settings remain unchanged.
+- Reported the selected precision in CUDA-Q execution statistics and Heisenberg
+  diagnostics. Diagnostic comparisons use tolerances appropriate to FP32/FP64,
+  without implying an accuracy or performance guarantee for arbitrary circuits.
+- Added `--precision single|double` to `examples/heisenberg_cudaq.py` and
+  documented supported configurations, refitting and numerical limitations.
+- Added CPU and opt-in GPU regression tests for all maps, precision switching,
+  cloning, validation, feature generation, exports and diagnostics.
+
+Validation (2026-10-19): 167 tests passed in the full local suite, with 38
+opt-in GPU tests skipped. A separate precision/CUDA-Q run passed all 105 tests
+on an NVIDIA GeForce RTX 5070 with CUDA-Q `0.16.0.post1`. The runnable Heisenberg
+example completed in both precisions. Local Creditcard tests depend on research
+notebooks excluded from Git; the local full-suite count includes those tests.
+
 ## 0.3.0
 
 - Added optional CUDA-Q GPU simulation to Heisenberg, CD-Ising and XYZ through

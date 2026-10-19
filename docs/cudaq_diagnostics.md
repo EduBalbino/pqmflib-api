@@ -3,6 +3,13 @@
 For installation and normal usage, see the [README](../README.md).
 Run the diagnostic snippets from the repository root after fitting a map.
 
+Both Heisenberg diagnostics use the fitted map's `precision` (`"double"` by
+default, or `"single"`) and report it in their result tables. Analytic
+comparisons use `atol=rtol=1e-10` for FP64 and `atol=rtol=2e-5` for FP32.
+These diagnostic tolerances are not general accuracy guarantees; errors also
+depend on circuit depth, observables and MPS truncation. The diagnostics do
+not change precision or truncation settings to make a comparison pass.
+
 The adapter caches the parameterized kernel across `transform()` calls. With
 CUDA-Q, XX/YY/ZZ rotations are preserved as native `exp_pauli(-theta/2, ...)`
 operations instead of decomposing them in the adapter into CNOTs and
@@ -55,7 +62,8 @@ provides `benchmark_heisenberg_cudaq_direct(fitted_map, X, repeats=3)`.
 It independently constructs a Heisenberg kernel from the original gates and
 compares it with the adapter on the same rows and observables, with identical
 GPU MPS settings. Pass already-PCA-transformed inputs when applicable. Warm-ups
-are excluded and features must agree within `atol=rtol=1e-10`. The adapter timing
+are excluded and features must agree within the precision-dependent tolerance
+above. The adapter timing
 includes parameter preprocessing; the direct route precomputes its angles.
 This diagnostic does not run on import and does not compare against CPU. Its
 independent circuit construction has CPU matrix-equivalence tests; GPU timing
@@ -95,10 +103,12 @@ contractions and sampling as applicable. `sample_seconds` measures the grouped
 These are not isolated GPU kernel
 timings. `state_kernel_initializations` counts calls that initialize a kernel
 from a saved MPS, not native SVD operations. Exact routes must agree within
-`atol=rtol=1e-10`; shot errors are reported against the analytic MPS reference
+the precision-dependent tolerance above; shot errors are reported against the
+analytic MPS reference
 without requiring equality across independently constructed kernels. That
 reference can itself contain MPS truncation error. Production
-`last_execution_stats` also includes the method, shot count, observable count,
+`last_execution_stats` also includes the precision, method, shot count,
+observable count,
 distinct Pauli term count, measurement group count, sampling call count/time
 and state-kernel initialization count. Statistics are
 available only after a successful execution.

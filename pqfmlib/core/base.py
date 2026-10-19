@@ -13,7 +13,9 @@ from sklearn.base import BaseEstimator, TransformerMixin
 
 from pqfmlib.core.backend import load_ibm_backend, make_aer_backend, make_estimator
 from pqfmlib.core.data import load_tabular_dataset
-from pqfmlib.core.framework import validate_framework_configuration
+from pqfmlib.core.framework import (
+    validate_framework_configuration, validate_precision, validate_aer_precision,
+)
 
 
 @dataclass
@@ -30,6 +32,7 @@ class BaseProjectiveQFM(TransformerMixin, BaseEstimator):
     fakebackend: bool = False
     ideal: bool = True
     framework: str = field(default="qiskit", kw_only=True)
+    precision: str = field(default="double", kw_only=True)
     expectation_method: str = field(default="shots", kw_only=True)
     shots: int = 4096
     ibm_qpu: str = "ibm_fez"
@@ -64,6 +67,7 @@ class BaseProjectiveQFM(TransformerMixin, BaseEstimator):
         if self.ideal:
             self.simulation = True
             self.fakebackend = False
+        self._validate_precision()
         if self.mps and self.use_gpu_statevector:
             self.use_gpu_statevector = False
         np.random.seed(self.seed)
@@ -162,6 +166,17 @@ class BaseProjectiveQFM(TransformerMixin, BaseEstimator):
             if self.mps:
                 raise ValueError("statevector requires mps=False (full state vector).")
 
+    def _validate_precision(self) -> None:
+        validate_precision(self.precision)
+        if not self.ideal and not self.simulation:
+            if self.precision == "single":
+                raise ValueError("precision='single' is a simulator option and cannot configure real QPU execution.")
+            return
+        if self.framework == "qiskit":
+            method = (self.fakebackend_method if self.fakebackend and not self.ideal
+                      else ("matrix_product_state" if self.mps else "statevector"))
+            validate_aer_precision(self.precision, method)
+
     def _validate_resource_estimation_mode(self) -> None:
         if self.ideal and bool(getattr(self, "resource_estimation", False)):
             raise ValueError("resource_estimation=True is invalid when ideal=True; ideal simulations do not use QPU resources.")
@@ -173,6 +188,7 @@ class BaseProjectiveQFM(TransformerMixin, BaseEstimator):
 
     def setup_backend_and_estimator(self) -> None:
         self._validate_framework()
+        self._validate_precision()
         self._validate_expectation_method()
         self._validate_resource_estimation_mode()
         if self.framework == "cudaq":
@@ -181,6 +197,7 @@ class BaseProjectiveQFM(TransformerMixin, BaseEstimator):
             if self.statevector_device not in (None, "GPU"):
                 raise ValueError("framework='cudaq' requires a GPU; statevector_device must be None or 'GPU'.")
             self.backend = CudaqExecutor(
+                precision=self.precision,
                 mps=self.mps,
                 seed=self.seed,
                 mps_max_bond_dimension=self.mps_max_bond_dimension,
@@ -197,6 +214,7 @@ class BaseProjectiveQFM(TransformerMixin, BaseEstimator):
                 if self.fakebackend:
                     self.backend = AerSimulator.from_backend(self.real_backend)
                     self.backend.set_options(
+                        precision=self.precision,
                         method=self.fakebackend_method,
                         device=self.fakebackend_device,
                         seed_simulator=self.seed,
@@ -219,6 +237,7 @@ class BaseProjectiveQFM(TransformerMixin, BaseEstimator):
 
     def _make_aer_backend(self):
         return make_aer_backend(
+            precision=self.precision,
             seed=self.seed,
             mps=self.mps,
             use_gpu_statevector=self.use_gpu_statevector,

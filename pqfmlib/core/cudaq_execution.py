@@ -21,6 +21,7 @@ from time import perf_counter
 import numpy as np
 from qiskit import transpile
 from qiskit.circuit import ParameterExpression
+from pqfmlib.core.framework import validate_precision
 
 
 # CUDA-Q targets and MPS environment settings are process-global. Serialize
@@ -240,7 +241,7 @@ def _sample_expectations(counts, supports, shots, num_qubits):
 
 
 class CudaqExecutor:
-    """Execute unitary PQFMs on cuStateVec or cuTensorNet, in double precision.
+    """Execute unitary PQFMs on cuStateVec or cuTensorNet in single/double precision.
 
     ``mps_max_bond_dimension=None`` permits the full Schmidt rank instead of
     CUDA-Q's default cap of 64. The existing truncation option is used as an
@@ -251,7 +252,8 @@ class CudaqExecutor:
     """
 
     def __init__(self, *, mps=False, seed=42, mps_max_bond_dimension=None,
-                 mps_truncation_threshold=1e-16):
+                 mps_truncation_threshold=1e-16, precision="double"):
+        validate_precision(precision)
         if mps_max_bond_dimension is not None and (
             isinstance(mps_max_bond_dimension, bool)
             or not isinstance(mps_max_bond_dimension, Integral)
@@ -261,6 +263,7 @@ class CudaqExecutor:
         if not np.isfinite(mps_truncation_threshold) or not 0 <= mps_truncation_threshold < 1:
             raise ValueError("CUDA-Q mps_truncation_threshold must be finite and in [0, 1).")
         self.target = "tensornet-mps" if mps else "nvidia"
+        self.precision = precision
         self.mps = mps
         self.seed = seed
         self.mps_max_bond_dimension = mps_max_bond_dimension
@@ -306,7 +309,7 @@ class CudaqExecutor:
             try:
                 os.environ.update(settings)
                 try:
-                    cudaq.set_target(self.target, option="fp64")
+                    cudaq.set_target(self.target, option="fp32" if self.precision == "single" else "fp64")
                 except Exception as exc:
                     raise RuntimeError(
                         f"CUDA-Q GPU target '{self.target}' is unavailable; "
@@ -364,6 +367,7 @@ class CudaqExecutor:
                 )
             automatic_bond = self._automatic_bond
         stats = dict(n_samples=len(theta), observe_calls=0, get_state_calls=0,
+                     precision=self.precision,
                      sample_calls=0, sample_seconds=0.0, n_measurement_groups=0,
                      n_observables=len(prepared.obs_isa_broadcast),
                      shots=int(shots) if expectation_method == "shots" else None,

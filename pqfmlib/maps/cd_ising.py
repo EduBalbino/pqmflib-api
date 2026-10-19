@@ -248,6 +248,7 @@ class CDIsingProjectiveQFM(BaseProjectiveQFM):
             bool(self.fakebackend),
             bool(self.ideal),
             self.framework,
+            self.precision,
             self.expectation_method,
             int(self.shots),
             str(self.ibm_qpu),

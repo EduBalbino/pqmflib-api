@@ -8,11 +8,13 @@ from qiskit_aer import AerSimulator
 from qiskit_ibm_runtime import QiskitRuntimeService, EstimatorV2 as Estimator
 
 from pqfmlib.utils.config import Config
+from pqfmlib.core.framework import validate_aer_precision
 
 
 def make_aer_backend(
     *,
     seed: int = 42,
+    precision: str = "double",
     mps: bool = False,
     use_gpu_statevector: bool = True,
     statevector_device: Optional[str] = None,
@@ -20,16 +22,18 @@ def make_aer_backend(
     mps_truncation_threshold: float = 1e-16,
 ):
     """Build an Aer backend for ideal simulations."""
+    validate_aer_precision(precision, "matrix_product_state" if mps else "statevector")
     if mps:
         backend = AerSimulator(
             method="matrix_product_state",
             matrix_product_state_max_bond_dimension=mps_max_bond_dimension,
             matrix_product_state_truncation_threshold=mps_truncation_threshold,
             device="CPU",
+            precision=precision,
         )
     else:
         device = statevector_device or ("GPU" if use_gpu_statevector else "CPU")
-        backend = AerSimulator(method="statevector", device=device)
+        backend = AerSimulator(method="statevector", device=device, precision=precision)
     backend.options.seed_simulator = seed
     backend.options.seed_transpiler = seed
     return backend

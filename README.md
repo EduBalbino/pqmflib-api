@@ -228,11 +228,14 @@ are required. After installing the CUDA-Q extra, run from the repository root:
 
 ```bash
 python examples/heisenberg_cudaq.py
+# Use single precision (FP32):
+python examples/heisenberg_cudaq.py --precision single
 ```
 
 The example selects `framework="cudaq"` and `expectation_method="exact"` for
 ideal simulation without measurement sampling. It prints the input and output
-shapes and the first quantum feature row. The same framework selection applies
+shapes, selected precision and the first quantum feature row. The default is
+double precision (FP64). The same framework selection applies
 to `CDIsingProjectiveQFM` and `XYZProjectiveQFM`.
 
 ## Choosing `framework` and `mps`
@@ -253,8 +256,8 @@ the framework:
 |---|---|---|
 | `framework="qiskit", mps=False` | Aer statevector | CPU by default; GPU when configured and available |
 | `framework="qiskit", mps=True` | Aer matrix product state | CPU |
-| `framework="cudaq", mps=False` | CUDA-Q `nvidia` / cuStateVec | GPU, double precision |
-| `framework="cudaq", mps=True` | CUDA-Q `tensornet-mps` / cuTensorNet | GPU, double precision |
+| `framework="cudaq", mps=False` | CUDA-Q `nvidia` / cuStateVec | GPU |
+| `framework="cudaq", mps=True` | CUDA-Q `tensornet-mps` / cuTensorNet | GPU |
 
 **In this version, CUDA-Q requires `simulation=True`, `ideal=True`, and
 `fakebackend=False`.** `ideal=False`, fake-backend simulation, QPU execution,
@@ -269,8 +272,8 @@ errors, with no fallback to Qiskit or CPU.
 ### Four simulation examples
 
 This complete example uses the same input and Heisenberg configuration in all
-four cases. The same framework options apply to `CDIsingProjectiveQFM` and
-`XYZProjectiveQFM`.
+four cases, with the default double precision. The same framework options
+apply to `CDIsingProjectiveQFM` and `XYZProjectiveQFM`.
 
 ```python
 import numpy as np
@@ -315,10 +318,64 @@ Xq_new = cudaq_mps.transform(X_new)
 All four configurations retain `fit(X, y=None)`, `transform(X)`, `fit_transform(X, y=None)`
 and `run()`. Feature matrices have shape `(n_samples, n_observables)` with the
 same column order and observable metadata for the same PQFM configuration.
-Changing `framework`, `mps`, or `expectation_method` after fitting requires a
-new `fit()`. `run()` retains CSV input, result dictionaries and CSV/NPY output;
+Changing `framework`, `mps`, `precision`, or `expectation_method` after fitting
+requires a new `fit()`. `run()` retains CSV input, result dictionaries and CSV/NPY output;
 use distinct `output_root` values when comparing saved results from different
 frameworks.
+
+### Choosing `precision`
+
+All three maps accept the keyword-only option `precision="double"` (FP64,
+the default) or `precision="single"` (FP32). This selects the simulator's
+internal floating-point precision, independently of the expectation method.
+
+| Simulation | `"single"` (FP32) | `"double"` (FP64) |
+|---|---|---|
+| Qiskit/Aer statevector, CPU or GPU | Supported | Supported |
+| Qiskit/Aer MPS | Unsupported; raises `ValueError` | Supported |
+| CUDA-Q statevector or MPS, GPU | Supported | Supported |
+
+For example, after installing CUDA-Q:
+
+```python
+import numpy as np
+from pqfmlib import HeisenbergProjectiveQFM
+
+X_train = np.random.default_rng(42).normal(size=(8, 4))
+pqfm = HeisenbergProjectiveQFM(
+    name_file="fp32_demo", q_enc=3,
+    framework="cudaq", precision="single",
+    simulation=True, ideal=True, fakebackend=False,
+    mps=False, expectation_method="exact",
+)
+X_quantum = pqfm.fit_transform(X_train)
+
+# A precision change requires refitting before further transforms.
+pqfm.set_params(precision="double")
+X_quantum_double = pqfm.fit_transform(X_train)
+```
+
+For Qiskit statevector, use `framework="qiskit"`, `mps=False` and
+`expectation_method="statevector"` with the same precision option. The option
+is preserved by cloning and applies to both the transformer API and `run()`.
+
+For Aer fake-backend simulations, FP32 requires an explicit compatible
+`fakebackend_method`: `"statevector"`, `"density_matrix"`, `"unitary"`,
+`"superop"` or `"tensor_network"`. Other requirements of the selected method
+(such as noise and device support) still apply. `"automatic"` and methods
+without FP32 support are rejected with `precision="single"` to avoid silently
+using a different precision. FP32 is also rejected for real-QPU execution;
+the default `"double"` does not configure physical hardware precision.
+
+FP32 uses fewer bytes per state/tensor element but introduces more rounding
+error; runtime and total memory savings depend on the circuit and backend.
+The input preprocessing and returned feature matrices retain their existing
+NumPy floating-point types. A `float64` output does not recover accuracy lost
+during FP32 simulation. Measurement sampling (`shots`) and MPS truncation are
+separate sources of error: changing `precision` does not change shot counts,
+bond limits or truncation thresholds. CUDA-Q execution statistics report the
+selected precision in `pqfm.backend.last_execution_stats["precision"]` after
+a successful execution.
 
 ### CUDA-Q numerical behavior and limits
 
@@ -346,8 +403,9 @@ truncation and floating-point error can still affect the result:
   effectively disabled; a zero threshold uses a near-zero positive value
   required by the CUDA-Q target.
 - The GPU integration tests compare small circuits for all three maps against
-  Qiskit statevector with `atol=rtol=1e-10`. This is not a guarantee of the same
-  tolerance for arbitrary circuit sizes or truncation settings.
+  Qiskit FP64 statevector, using `atol=rtol=1e-10` for FP64 and `2e-5` for FP32
+  in the precision tests. These are test tolerances, not accuracy guarantees
+  for arbitrary circuit sizes or truncation settings.
 
 For implementation details, execution statistics and developer benchmarks, see
 [CUDA-Q diagnostics](docs/cudaq_diagnostics.md).
@@ -367,19 +425,21 @@ With the development dependencies installed (`pip install -e ".[dev]"`), run
 the CPU/optional-dependency regression tests:
 
 ```bash
-python -m pytest -q tests/test_framework_selection.py tests/test_statevector_execution.py tests/test_cudaq_execution.py
+python -m pytest -q tests/test_framework_selection.py tests/test_statevector_execution.py tests/test_cudaq_execution.py tests/test_precision.py
 ```
 
 GPU tests are opt-in and skipped by the command above. To execute both actual
 GPU targets, including all three PQFMs, parameter/observable ordering, repeated
-transforms and `run()` exports:
+transforms and `run()` exports, as well as FP32/FP64 precision checks:
 
 ```bash
-PQFMLIB_TEST_CUDAQ_GPU=1 python -m pytest -q tests/test_cudaq_execution.py
+PQFMLIB_TEST_CUDAQ_GPU=1 python -m pytest -q tests/test_cudaq_execution.py tests/test_precision.py
 ```
 
 Once enabled, missing CUDA-Q, a missing GPU or an unavailable target causes a
-test failure rather than a skip. No credentials or real-QPU jobs are used.
+test failure rather than a skip. The precision tests also exercise Qiskit on
+GPU and require a GPU-enabled Aer installation. No credentials or real-QPU
+jobs are used.
 
 ## Choosing `expectation_method` (since 0.2.0)
 

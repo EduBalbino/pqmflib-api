@@ -25,7 +25,7 @@ def _package_version() -> str:
     try:
         return version("pqfmlib")
     except PackageNotFoundError:
-        return "0.3.0"
+        return "0.4.0"
 
 
 __version__ = _package_version()

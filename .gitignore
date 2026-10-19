@@ -23,6 +23,7 @@ env/
 outputs/
 tests/*
 !tests/test_framework_selection.py
+!tests/test_precision.py
 !tests/test_cudaq_execution.py
 !tests/test_statevector_execution.py
 !tests/test_xyz_shap_notebook.py

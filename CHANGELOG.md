@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.0
+
+- Added configurable Heisenberg interaction topology: `chain` preserves the
+  existing behavior, `full` uses all logical qubit pairs for ideal simulation,
+  and `native` builds interactions from a connected QPU subgraph.
+- Added `shared_feature` and `multi_axis` encodings with selectable `x`, `y`,
+  and `z` interaction axes. The default remains one feature shared across the
+  original `XX`, `YY`, and `ZZ` chain interactions.
+- Added optional two-local cross observables independently of encoding axes,
+  plus ordered metadata for encoding, edges, parameters, observables and layout.
+- Added logical and transpiled QPY save/load support with validation of circuit
+  parameters, layout, backend instructions and available encoding metadata.
+- Documented the new Heisenberg options and added topology and fixed-circuit
+  examples and regression tests.
+
+Validation (2026-10-22): 72 tests passed and 10 opt-in GPU tests were skipped
+across the Heisenberg transformer, topology, fixed-circuit, framework-selection,
+statevector and precision suites. The tests emitted Qiskit deprecation warnings.
+
 ## 0.4.0
 
 - Added `precision="single"` (FP32) and `precision="double"` (FP64, default)

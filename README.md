@@ -221,22 +221,19 @@ only if you also want Qiskit statevector execution on GPU.
 
 ### CUDA-Q practical example
 
-The runnable [Heisenberg example](examples/heisenberg_cudaq.py) creates a small
-local dataset, splits and standardizes the inputs, then generates training and
-test quantum features on an NVIDIA GPU. No CSV file or hardware credentials
-are required. After installing the CUDA-Q extra, run from the repository root:
+The [Heisenberg CUDA-Q example](examples/heisenberg_cudaq.py) follows the basic
+examples: configure `HeisenbergProjectiveQFM` and call `run()`. It reads
+`data/Toxicity_preprocessed_shuffled.csv`; edit `name_file` to select your dataset.
+After installing the CUDA-Q extra, run from the repository root:
 
 ```bash
 python examples/heisenberg_cudaq.py
-# Use single precision (FP32):
-python examples/heisenberg_cudaq.py --precision single
 ```
 
 The example selects `framework="cudaq"` and `expectation_method="exact"` for
-ideal simulation without measurement sampling. It prints the input and output
-shapes, selected precision and the first quantum feature row. The default is
-double precision (FP64). The same framework selection applies
-to `CDIsingProjectiveQFM` and `XYZProjectiveQFM`.
+ideal simulation on an NVIDIA GPU. Edit `precision="double"` to `"single"` in
+the file for FP32. The same framework selection applies to
+`CDIsingProjectiveQFM` and `XYZProjectiveQFM`.
 
 ## Choosing `framework` and `mps`
 
@@ -674,30 +671,132 @@ terms on available edges.
 ### Heisenberg PQFM
 
 `HeisenbergProjectiveQFM` follows the Heisenberg-style projected quantum feature
-maps used in [2,3]. It prepares one random single-qubit unitary per qubit and
-then applies repeated even/odd nearest-neighbor chain layers. Each normalized
-scalar feature drives an isotropic two-qubit interaction:
+maps used in [2,3]. It prepares one fixed, seeded random unitary per qubit and
+encodes features **only in two-qubit interactions**. It does not learn mutual
+information or encode features in local fields. The default remains the
+original chain with one feature shared across `XX`, `YY`, and `ZZ` per edge.
+
+| Option | Default | Behavior |
+|---|---|---|
+| `topology` | `"chain"` | `"chain"`, `"native"`, or `"full"` |
+| `interaction_axes` | `("x", "y", "z")` | One to three unique axes; order defines feature assignment in `multi_axis` |
+| `encoding_mode` | `"shared_feature"` | One feature per edge, or `"multi_axis"` for one feature per selected axis per edge |
+| `measure_2local_diagonal` | `False` | Add separate `ZZ`, `XX`, `YY` observables on each active edge |
+| `measure_cross_observables` | `False` | Add separate `XY`, `YX`, `XZ`, `ZX`, `YZ`, `ZY` observables on each active edge |
+
+**Topology and feature assignment.** `chain` uses `q_enc - 1` edges and preserves
+the original even-edge/odd-edge schedule. `full` requires `ideal=True` and uses
+all `q_enc * (q_enc - 1) / 2` unordered pairs, without self-interactions.
+`native` requires `ideal=False` and uses all native connections within a
+connected subset of `q_enc` physical qubits of the target backend. Select the
+subset automatically or supply `use_fixed_phys_nodes=True` and
+`fixed_phys_nodes_file="phys_nodes.json"`, containing an ordered list of physical
+qubit indices. The selected nodes become the initial transpiler layout; routing
+may still change the final layout.
+
+For `full` and `native`, edges are sorted by logical indices `(i, j)`, with `i < j`;
+bidirectional hardware connections count once. In `multi_axis`, columns fill
+slots by block, then edge, then the order of `interaction_axes`. With `E` edges
+and `A` selected axes, block capacity is `E` for `shared_feature` and `E * A` for
+`multi_axis`. Excess features create additional blocks; unused slots in the last
+block are zero. For example, on a three-qubit chain with axes `("x", "y")`, the
+first four multi-axis features fill `XX(0,1)`, `YY(0,1)`, `XX(1,2)`, `YY(1,2)`.
+
+The interaction coefficients have the form
 
 ```math
-H_{\mathrm{Heisenberg}}(x)
-= \sum_{i} J_i
-(
-X_i X_{i+1}
-+ Y_i Y_{i+1}
-+ Z_i Z_{i+1}
-) .
+H_b(x) = \sum_{(i,j)\in E} \sum_{a\in A} J_{b,ij}^{(a)}(x)\,\sigma_i^a\sigma_j^a.
 ```
 
-Here $J_i$ denotes the angle assigned to the chain edge $(i,i+1)$. Using the
-normalized feature convention defined in **Data Format**, the Heisenberg map
-scales each assigned feature as:
+In `shared_feature`, the selected axes on an edge share the same feature,
+allowing, for example, `J(XX + YY)`. In `multi_axis`, they use distinct features,
+allowing `Jx*XX + Jy*YY` or `Jx*XX + Jy*YY + Jz*ZZ`. By default, each input feature
+is scaled to `2*pi*tanh(x/3)`; `use_tanh_scaling=False` uses the input directly.
+Each selected `RXX`, `RYY`, or `RZZ` gate receives angle
+`alpha / (2 * num_blocks)` times that scaled value. The block sequence repeats
+`R` times with the same parameters. Preprocessing of the input remains the
+caller's responsibility.
 
-```math
-J_i = 2\pi \tanh\left(\frac{\bar{x}_{f(i)}}{3}\right).
+**Measurements are independent of encoding.** One-local `Z`, `X`, `Y` are always
+measured on every qubit, in that order per qubit. Optional two-local measurements
+follow sorted edges, with diagonal terms first and then the six cross terms in
+the order listed above. With `n` qubits and `E` edges, output width is
+`3*n + 3*E*measure_2local_diagonal + 6*E*measure_cross_observables`.
+`XY` and `YX` are separate columns. Selecting only `XX` for encoding does not
+remove any requested measurement axes. Cross measurements do not introduce
+cross interactions into the encoding Hamiltonian. The legacy `axes` argument
+does not select the encoding; use `interaction_axes`.
+
+```python
+import numpy as np
+from pqfmlib import HeisenbergProjectiveQFM
+
+X = np.random.default_rng(42).normal(size=(8, 7))
+qfm = HeisenbergProjectiveQFM(
+    name_file="heisenberg_full", q_enc=3, ideal=True,
+    topology="full", interaction_axes=("x", "y"), encoding_mode="multi_axis",
+    measure_2local_diagonal=True, measure_cross_observables=True,
+    expectation_method="statevector",
+)
+Xq = qfm.fit_transform(X)  # shape (8, 36); 6 feature slots per block
 ```
 
-The default observables are one-local $Z$, $X$, and $Y$ for every qubit, with an
-option to include two-local diagonal observables $ZZ$, $XX$, and $YY$.
+After `fit`, changing topology, encoding axes/mode, or measurement flags requires
+a new `fit`. The [topology example](examples/heisenberg_topologies.py) configures
+one map and calls `run()`, like the other basic examples. It reads
+`data/Toxicity_preprocessed_shuffled.csv` and defaults to ideal full connectivity,
+multi-axis encoding on `x` and `y`, and diagonal plus cross measurements.
+Edit the constructor arguments to select another dataset, encoding or topology.
+For native connectivity, set `ideal=False`, `topology="native"`, and the target
+`ibm_qpu`; retrieving its topology requires configured IBM access.
+
+```bash
+python examples/heisenberg_topologies.py
+```
+
+**Saving and loading QPY circuits.** `run()` retains its CSV/NPY interface and
+also saves `heisenberg_circuit.qpy`, `phys_nodes.json` when available, and
+`heisenberg_metadata.json`. When the logical source is available, it also saves
+`heisenberg_circuit_logical.qpy`. Simulation result dictionaries include
+`metadata_path`; real-QPU submissions additionally produce `job_meta.json`.
+The metadata records encoding configuration, edges, parameter names/order,
+measurement flags and ordered observable labels, plus physical layouts when
+available. Output folders distinguish topology, encoding and optional
+measurements; the default configuration keeps its original folder naming.
+
+Set `fixed_circuit_file_name` to a QPY path to reuse either encoding mode:
+
+```python
+qfm = HeisenbergProjectiveQFM(
+    name_file="my_dataset", q_enc=3,
+    ideal=False, simulation=False, ibm_qpu="YOUR_QPU_NAME",
+    topology="native", interaction_axes=("x", "y"), encoding_mode="multi_axis",
+    fixed_circuit_file_name="saved/heisenberg_circuit.qpy",
+    measure_cross_observables=True,
+)
+# qfm.run() submits a real QPU job using data/my_dataset.csv.
+# Supply the same R, alpha, seed and feature/block configuration as the saved circuit.
+```
+
+A logical QPY is transpiled for the selected QPU. A compatible transpiled QPY
+keeps its gates and layout; native topology derives its physical subset from
+the saved initial layout unless a fixed-node file is explicitly supplied. That
+file must agree with the saved layout. Observables use the **final** layout,
+including routing permutations. An incompatible physical circuit is rejected;
+use the logical QPY to compile for another backend. For a native logical QPY,
+use the corresponding saved `phys_nodes.json` if automatic selection would
+produce a different graph.
+
+The loader checks exact parameter names, qubit/layout consistency, backend
+instruction support for physical QPU circuits, and encoding metadata when
+present. QPY files must contain exactly one parameterized feature circuit,
+without measurements or classical bits. New circuits built by
+`build_heisenberg_chain_feature_circuit` carry versioned encoding metadata,
+which survives transpilation and QPY serialization. Older QPYs without this
+metadata remain accepted with a warning: the caller must provide the correct
+encoding configuration because parameter names alone cannot verify axis
+assignment, interaction scales, or the edge schedule. `full` remains an ideal
+simulation topology, including when loading QPY files.
 
 ### XYZ PQFM
 

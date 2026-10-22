@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import warnings
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -13,6 +14,7 @@ from qiskit import QuantumCircuit, qpy, transpile
 from qiskit.quantum_info import SparsePauliOp, random_unitary
 from qiskit.transpiler import Layout
 from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+from qiskit_aer import AerSimulator
 
 from pqfmlib.core.base import BaseProjectiveQFM
 from pqfmlib.core.execution import (
@@ -27,7 +29,7 @@ from pqfmlib.core.resources import test_circuit_t
 from pqfmlib.core.serialization import metadata_to_column_name
 from pqfmlib.hardware.coupling import get_coupling_edges_and_costs
 from pqfmlib.hardware.feature_assignment import pick_connected_subset_greedy
-from pqfmlib.hardware.layout import validate_phys_nodes
+from pqfmlib.hardware.layout import edges_log_from_phys_nodes, validate_phys_nodes
 from pqfmlib.utils.io import load_json, save_circuit_draw, save_json
 
 
@@ -35,6 +37,7 @@ def heisenberg_chain_observables(
     num_qubits: int,
     *,
     measure_2local_diagonal: bool = False,
+    measure_cross_observables: bool = False,
     edges_act: list[tuple[int, int]] | None = None,
 ):
     """Build Heisenberg observables.
@@ -43,6 +46,8 @@ def heisenberg_chain_observables(
 
     Optionally measures two-local diagonal observables:
         ZZ, XX, YY
+    Independently, cross observables add XY, YX, XZ, ZX, YZ, ZY per edge.
+    Measurements do not depend on the axes selected for encoding.
 
     By default, two-local observables are measured on nearest-neighbor
     chain edges only.
@@ -63,23 +68,54 @@ def heisenberg_chain_observables(
             metadata.append((axis, i))
 
     # Two-local diagonal observables: ZZ, XX, YY.
-    if measure_2local_diagonal:
+    if measure_2local_diagonal or measure_cross_observables:
         if edges_act is None:
             edges_act = [(i, i + 1) for i in range(num_qubits - 1)]
 
         edges = sorted({(min(i, j), max(i, j)) for i, j in edges_act})
 
+        axis_pairs = ["zz", "xx", "yy"] if measure_2local_diagonal else []
+        if measure_cross_observables:
+            axis_pairs += ["xy", "yx", "xz", "zx", "yz", "zy"]
         for i, j in edges:
-            for axis in ("z", "x", "y"):
-                axis_pair = axis + axis
+            for axis_pair in axis_pairs:
                 obs.append(
                     SparsePauliOp.from_list(
-                        [(pauli_string(num_qubits, [(i, axis), (j, axis)]), 1.0)]
+                        [(pauli_string(num_qubits, [(i, axis_pair[0]), (j, axis_pair[1])]), 1.0)]
                     )
                 )
                 metadata.append((axis_pair, i, j))
 
     return obs, metadata
+
+
+def _heisenberg_edge_schedule(num_qubits, edges_act=None):
+    """Keep the legacy even/odd chain order or canonicalize an explicit graph."""
+    if edges_act is None:
+        return [(i, i + 1) for parity in (0, 1)
+                for i in range(parity, num_qubits - 1, 2)]
+    edges = set()
+    for i, j in edges_act:
+        if not isinstance(i, (int, np.integer)) or not isinstance(j, (int, np.integer)):
+            raise ValueError("Interaction edges must use integer qubit indices.")
+        if not 0 <= i < num_qubits or not 0 <= j < num_qubits or i == j:
+            raise ValueError("Interaction edges must connect distinct in-range qubits.")
+        edges.add((min(i, j), max(i, j)))
+    if not edges:
+        raise ValueError("Heisenberg requires at least one interaction edge.")
+    return sorted(edges)
+
+
+def _validate_interaction_encoding(interaction_axes, encoding_mode):
+    """Validate interaction-only encoding; axis order defines feature order."""
+    if not isinstance(interaction_axes, (tuple, list)):
+        raise ValueError("interaction_axes must be a tuple or list of x, y, z.")
+    axes = tuple(str(axis).lower() for axis in interaction_axes)
+    if not axes or len(set(axes)) != len(axes) or any(a not in ("x", "y", "z") for a in axes):
+        raise ValueError("interaction_axes must contain 1 to 3 unique axes from x, y, z.")
+    if encoding_mode not in ("shared_feature", "multi_axis"):
+        raise ValueError("encoding_mode must be 'shared_feature' or 'multi_axis'.")
+    return axes
 
 
 def make_heisenberg_theta_matrix(
@@ -88,22 +124,33 @@ def make_heisenberg_theta_matrix(
     *,
     features_per_block: Optional[int] = None,
     use_tanh_scaling: bool = True,
+    edges_act: list[tuple[int, int]] | None = None,
+    interaction_axes: tuple[str, ...] = ("x", "y", "z"),
+    encoding_mode: str = "shared_feature",
 ):
     """Build the parameter matrix used by the notebook Heisenberg map.
 
+    Explicit ``edges_act`` select a graph; otherwise the legacy chain is used.
+    Shared encoding uses one feature per edge. Multi-axis encoding uses one
+    feature per selected axis per edge, in ``interaction_axes`` order. Input
+    columns fill these slots sequentially; the last block is padded with zeros.
     The notebook uses ``features_per_block = num_qubits - 1`` because each block
     encodes one feature per nearest-neighbor chain edge. If the dataset has more
     features than one block can cover, additional blocks are appended.
     """
     num_qubits = int(num_qubits)
+    axes = _validate_interaction_encoding(interaction_axes, encoding_mode)
+    edge_capacity = len(_heisenberg_edge_schedule(num_qubits, edges_act))
+    if encoding_mode == "multi_axis":
+        edge_capacity *= len(axes)
     if features_per_block is None:
-        features_per_block = num_qubits - 1
+        features_per_block = edge_capacity
     features_per_block = int(features_per_block)
 
     if features_per_block <= 0:
         raise ValueError("features_per_block must be positive.")
-    if features_per_block > num_qubits - 1:
-        raise ValueError("features_per_block cannot exceed num_qubits - 1 for the chain map.")
+    if features_per_block > edge_capacity:
+        raise ValueError("features_per_block cannot exceed the interaction encoding capacity.")
 
     n_samples, num_features = X.shape
     theta_raw = X.astype(np.float64, copy=True)
@@ -134,12 +181,18 @@ def build_heisenberg_chain_feature_circuit(
     alpha: float = 0.1,
     seed: int = 42,
     add_barriers: bool = True,
+    edges_act: list[tuple[int, int]] | None = None,
+    interaction_axes: tuple[str, ...] = ("x", "y", "z"),
+    encoding_mode: str = "shared_feature",
 ):
     """Build the notebook Heisenberg feature-map circuit.
 
-    For each chain edge, the same scalar parameter is used in RZZ, RXX, and RYY.
-    The even-edge sweep is followed by the odd-edge sweep, and this block is
-    repeated ``R`` times.
+    Explicit ``edges_act`` use sorted undirected edges instead of the chain.
+    Shared encoding uses one parameter for all selected axes on an edge.
+    Multi-axis encoding assigns consecutive parameters in interaction_axes order.
+    Only RXX, RYY and RZZ encode features; initial local unitaries are fixed.
+    For the default chain, the even-edge sweep precedes the odd-edge sweep.
+    Each complete schedule is repeated ``R`` times.
     """
     from qiskit.circuit import ParameterVector
 
@@ -147,15 +200,15 @@ def build_heisenberg_chain_feature_circuit(
     num_blocks = int(num_blocks)
     R = int(R)
 
+    axes = _validate_interaction_encoding(interaction_axes, encoding_mode)
+    edges = _heisenberg_edge_schedule(num_qubits, edges_act)
+    features_per_edge = len(axes) if encoding_mode == "multi_axis" else 1
+    capacity = len(edges) * features_per_edge
     if features_per_block is None:
-        features_per_block = num_qubits - 1
+        features_per_block = capacity
     features_per_block = int(features_per_block)
-
-    if features_per_block != num_qubits - 1:
-        raise ValueError(
-            "The notebook Heisenberg circuit expects features_per_block = num_qubits - 1. "
-            "Use the default unless you intentionally modify the edge schedule."
-        )
+    if features_per_block != capacity:
+        raise ValueError("features_per_block must equal the interaction encoding capacity.")
 
     qc = QuantumCircuit(num_qubits)
 
@@ -169,22 +222,29 @@ def build_heisenberg_chain_feature_circuit(
     for _rep in range(R):
         index = 0
         for _block in range(num_blocks):
-            for j in range(0, num_qubits - 1, 2):
-                angle = phi_scale * theta[index]
-                qc.rzz(angle, j, j + 1)
-                qc.rxx(angle, j, j + 1)
-                qc.ryy(angle, j, j + 1)
-                index += 1
-
-            for j in range(1, num_qubits - 1, 2):
-                angle = phi_scale * theta[index]
-                qc.rzz(angle, j, j + 1)
-                qc.rxx(angle, j, j + 1)
-                qc.ryy(angle, j, j + 1)
-                index += 1
+            for i, j in edges:
+                # Preserve the legacy gate order; features follow interaction_axes.
+                for axis, gate in (("z", qc.rzz), ("x", qc.rxx), ("y", qc.ryy)):
+                    if axis in axes:
+                        offset = axes.index(axis) if encoding_mode == "multi_axis" else 0
+                        gate(phi_scale * theta[index + offset], i, j)
+                index += features_per_edge
 
             if add_barriers:
                 qc.barrier()
+
+    qc.metadata = {"pqfmlib_heisenberg": {
+        "schema_version": 1,
+        "q_enc": num_qubits,
+        "edge_schedule": [list(edge) for edge in edges],
+        "interaction_axes": list(axes),
+        "encoding_mode": encoding_mode,
+        "num_blocks": num_blocks,
+        "features_per_block": features_per_block,
+        "R": R,
+        "alpha": float(alpha),
+        "seed": int(seed),
+    }}
 
     return qc, list(theta), {
         "R": int(R),
@@ -210,6 +270,20 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
 
     Parameters
     ----------
+    topology:
+        "chain" preserves the original schedule. "full" requires ideal=True.
+        "native" requires ideal=False and uses the induced QPU subgraph on
+        q_enc selected physical nodes, pinned as the initial transpiler layout.
+        Fixed QPY files support both encodings and all available topologies.
+    interaction_axes:
+        One to three axes from x, y, z. In multi_axis mode their order defines
+        feature assignment within each edge. Independent of measurement axes.
+    encoding_mode:
+        "shared_feature" uses one feature per edge across the selected axes;
+        "multi_axis" uses one feature per selected axis per edge.
+    measure_cross_observables:
+        Add separate XY, YX, XZ, ZX, YZ, ZY measurements on each active edge.
+        Independent of measure_2local_diagonal; does not change encoding.
     R:
         Number of repetitions of the even/odd Heisenberg chain schedule.
     alpha:
@@ -217,11 +291,22 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
         ``alpha / (2 * num_blocks)`` as in the notebook.
     use_tanh_scaling:
         If True, encode features as ``2*pi*tanh(x/3)``.
+    fixed_circuit_file_name:
+        Load a logical or transpiled QPY. Logical circuits are compiled for QPU
+        execution; compatible transpiled circuits retain their layout. Encoding
+        metadata is checked when present. For older QPYs, the supplied encoding
+        configuration is used with a warning because its semantics cannot be verified.
     use_fixed_phys_nodes:
-        If False, the transpiler is allowed to choose a layout and the selected
-        initial physical qubits are saved. If True, the given physical nodes are
+        For the chain, False lets the transpiler choose a layout. For native
+        topology, False selects a connected subgraph automatically.
+        If True, the given physical nodes are
         used as an initial layout, while routing remains enabled.
     """
+
+    topology: str = field(default="chain", kw_only=True)
+    interaction_axes: tuple[str, ...] = field(default=("x", "y", "z"), kw_only=True)
+    encoding_mode: str = field(default="shared_feature", kw_only=True)
+    measure_cross_observables: bool = field(default=False, kw_only=True)
 
     R: int = 2
     alpha: float = 0.1
@@ -240,8 +325,11 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        self._validate_topology()
+        self._validate_encoding()
         if int(self.q_enc) < 2:
             raise ValueError("HeisenbergProjectiveQFM requires q_enc >= 2.")
+        self.edges_act = None
         self.phys_nodes = None
         self.obs_metadata = None
         self.Xq_all_raw = None
@@ -249,11 +337,34 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
         self.theta_info = None
         self.circuit_info = None
         self._prepared_execution = None
+        self._fixed_circuit = None
+        self.metadata_output_path = None
+
+    def _validate_topology(self):
+        if self.topology not in ("chain", "native", "full"):
+            raise ValueError("topology must be 'chain', 'native', or 'full'.")
+        if self.topology == "full" and not self.ideal:
+            raise ValueError("topology='full' requires ideal=True.")
+        if self.topology == "native" and self.ideal:
+            raise ValueError("topology='native' requires ideal=False and a target QPU.")
+
+    def _validate_encoding(self):
+        self.interaction_axes = _validate_interaction_encoding(self.interaction_axes, self.encoding_mode)
+
+    def _encoding_edges(self):
+        # None retains the exact legacy chain parameter ordering.
+        if self.topology != "chain" and self.edges_act is None:
+            raise RuntimeError("Call prepare_layout() before building the interaction map.")
+        return None if self.topology == "chain" else self.edges_act
 
     def _transform_config_signature(self) -> tuple:
         """Return configuration that must remain unchanged after fit."""
         return (
             "HeisenbergProjectiveQFM",
+            self.topology,
+            tuple(self.interaction_axes),
+            self.encoding_mode,
+            bool(self.measure_cross_observables),
             int(self.seed),
             bool(self.simulation),
             bool(self.fakebackend),
@@ -284,6 +395,7 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
         )
 
     def _reset_fitted_map_state(self) -> None:
+        self.edges_act = None
         self.phys_nodes = None
         self.obs_metadata = None
         self.Xq_all_raw = None
@@ -291,6 +403,8 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
         self.theta_info = None
         self.circuit_info = None
         self._prepared_execution = None
+        self._fixed_circuit = None
+        self.metadata_output_path = None
 
     def _build_circuit_and_observables(self):
         qc_param, param_order, self.circuit_info = build_heisenberg_chain_feature_circuit(
@@ -301,10 +415,16 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
             alpha=self.alpha,
             seed=self.seed,
             add_barriers=self.add_barriers,
+            edges_act=self._encoding_edges(),
+            interaction_axes=self.interaction_axes,
+            encoding_mode=self.encoding_mode,
         )
+        qc_param.metadata["pqfmlib_heisenberg"]["use_tanh_scaling"] = bool(self.use_tanh_scaling)
         obs_list, obs_metadata = heisenberg_chain_observables(
             self.q_enc,
             measure_2local_diagonal=self.measure_2local_diagonal,
+            measure_cross_observables=self.measure_cross_observables,
+            edges_act=self.edges_act,
         )
         return qc_param, param_order, obs_list, obs_metadata
 
@@ -335,18 +455,22 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
         if not self.simulation:
             raise NotImplementedError("fit()/transform() currently support only simulation=True.")
 
+        self._validate_topology()
+        self._validate_encoding()
         self._prepare_fit_input(X)
         self._reset_fitted_map_state()
         self.base_folder = None
         self.num_features = self.n_features_in_
+        self.setup_backend_and_estimator()
+        self.prepare_layout()
         _unused_theta, self.theta_info = make_heisenberg_theta_matrix(
             np.zeros((1, self.n_features_in_), dtype=float),
             self.q_enc,
-            features_per_block=self.q_enc - 1,
+            edges_act=self._encoding_edges(),
+            interaction_axes=self.interaction_axes,
+            encoding_mode=self.encoding_mode,
             use_tanh_scaling=self.use_tanh_scaling,
         )
-        self.setup_backend_and_estimator()
-        self.prepare_layout()
         self._prepare_fitted_execution()
         self._mark_fitted(self._transform_config_signature())
         return self
@@ -358,6 +482,9 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
             X_transform,
             self.q_enc,
             features_per_block=self.theta_info["features_per_block"],
+            edges_act=self._encoding_edges(),
+            interaction_axes=self.interaction_axes,
+            encoding_mode=self.encoding_mode,
             use_tanh_scaling=self.use_tanh_scaling,
         )
         structural_keys = (
@@ -387,7 +514,10 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
         return self.fit(X, y=y).transform(X)
 
     def prepare_output_folder(self) -> None:
-        features_per_block = int(self.q_enc) - 1
+        features_per_block = (int(self.q_enc) - 1 if self.topology == "chain"
+                              else len(self.edges_act))
+        if self.encoding_mode == "multi_axis":
+            features_per_block *= len(self.interaction_axes)
         parts = [
             f"heisenberg__R{int(self.R)}",
             "quantum_features",
@@ -401,14 +531,44 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
             parts.append(self.ibm_qpu)
             if self.simulation:
                 parts.append("fakebackend" if self.fakebackend else "simulacao")
+        if self.topology != "chain":
+            parts.append(self.topology)
+        if self.encoding_mode != "shared_feature" or self.interaction_axes != ("x", "y", "z"):
+            parts.extend([self.encoding_mode, "axes" + "".join(self.interaction_axes)])
+        if self.measure_2local_diagonal:
+            parts.append("diagobs")
+        if self.measure_cross_observables:
+            parts.append("crossobs")
         self.ensure_output_folder("_".join(parts))
 
     def prepare_layout(self) -> None:
+        self._validate_topology()
+        self._validate_encoding()
+        self._fixed_circuit = None
+        saved_nodes = None
+        if self.fixed_circuit_file_name:
+            saved_nodes = self._fixed_initial_nodes(self._read_fixed_circuit())
+        self.edges_act = [(i, i + 1) for i in range(self.q_enc - 1)]
         if self.ideal:
+            if self.topology == "full":
+                self.edges_act = [(i, j) for i in range(self.q_enc)
+                                  for j in range(i + 1, self.q_enc)]
             self.phys_nodes = list(range(self.q_enc))
             return
 
         self._load_real_backend()
+        if self.topology == "native":
+            coupling_edges, edge_cost = get_coupling_edges_and_costs(self.real_backend)
+            self.phys_nodes = (
+                load_json(self.fixed_phys_nodes_file) if self.use_fixed_phys_nodes
+                else saved_nodes if saved_nodes is not None
+                else pick_connected_subset_greedy(self.q_enc, coupling_edges, edge_cost)
+            )
+            validate_phys_nodes(self.phys_nodes, self.q_enc, coupling_edges, self.ibm_qpu)
+            self.edges_act, _ = edges_log_from_phys_nodes(
+                coupling_edges, self.phys_nodes, edge_cost,
+            )
+            return
         if self.use_fixed_phys_nodes:
             coupling_edges, _edge_cost = get_coupling_edges_and_costs(self.real_backend)
             self.phys_nodes = load_json(self.fixed_phys_nodes_file)
@@ -416,95 +576,141 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
         else:
             # In notebook mode, the transpiler chooses the layout. The selected
             # physical nodes are extracted and saved after transpilation.
-            self.phys_nodes = None
+            self.phys_nodes = saved_nodes
+
+    def _read_fixed_circuit(self):
+        if self._fixed_circuit is None:
+            path = Path(self.fixed_circuit_file_name)
+            if path.suffix != ".qpy":
+                path = path.with_suffix(".qpy")
+            with path.open("rb") as stream:
+                circuits = qpy.load(stream)
+            if len(circuits) != 1:
+                raise ValueError("The fixed QPY file must contain exactly one circuit.")
+            self._fixed_circuit = circuits[0]
+        return self._fixed_circuit
+
+    def _fixed_initial_nodes(self, circuit):
+        if circuit.layout is None:
+            if circuit.num_qubits != self.q_enc:
+                raise ValueError("A fixed logical circuit must have q_enc qubits. "
+                                 "Physical circuits require a saved transpiler layout.")
+            return None
+        try:
+            # QPY may reorder Layout's dictionary entries. Use input indices,
+            # not dictionary iteration order (older Qiskit initial_index_layout).
+            virtual = circuit.layout.initial_virtual_layout(filter_ancillas=True).get_virtual_bits()
+            nodes = [virtual[q] for q in sorted(virtual, key=circuit.layout.input_qubit_mapping.get)]
+            final_nodes = circuit.layout.final_index_layout(filter_ancillas=True)
+        except Exception as exc:
+            raise ValueError("Cannot recover the fixed circuit's logical-to-physical layout.") from exc
+        for mapping in (nodes, final_nodes):
+            if (len(mapping) != self.q_enc or len(set(mapping)) != self.q_enc
+                    or any(q < 0 or q >= circuit.num_qubits for q in mapping)):
+                raise ValueError("Fixed circuit layout is incompatible with q_enc or circuit width.")
+        return list(nodes)
+
+    def _validate_fixed_circuit(self, circuit, reference):
+        validate_circuit_parameter_compatibility(circuit, list(reference.parameters))
+        stored = (circuit.metadata or {}).get("pqfmlib_heisenberg")
+        expected = reference.metadata["pqfmlib_heisenberg"]
+        if stored is None:
+            warnings.warn(
+                "Fixed QPY has no Heisenberg encoding metadata. Using the supplied configuration; "
+                "axis assignments, edge schedule and interaction scales cannot be verified.",
+                UserWarning, stacklevel=2,
+            )
+        else:
+            if not isinstance(stored, dict) or stored.get("schema_version") != 1:
+                raise ValueError("Unsupported Heisenberg circuit metadata schema.")
+            mismatches = [key for key, value in expected.items()
+                          if (key != "use_tanh_scaling" or key in stored) and stored.get(key) != value]
+            if mismatches:
+                raise ValueError("Fixed circuit encoding configuration differs: " + ", ".join(mismatches))
+        nodes = self._fixed_initial_nodes(circuit)
+        if nodes is not None:
+            if (not self.ideal and self.use_fixed_phys_nodes and self.phys_nodes != nodes):
+                raise ValueError("Fixed circuit layout conflicts with fixed_phys_nodes_file.")
+            self.phys_nodes = nodes
+        if isinstance(self.backend, AerSimulator) and circuit.num_qubits > self.backend.num_qubits:
+            # A saved ISA circuit includes physical ancillas beyond q_enc.
+            self.backend.set_max_qubits(circuit.num_qubits)
+        if circuit.num_clbits or any(inst.operation.name in ("measure", "reset") for inst in circuit.data):
+            raise ValueError("Fixed Heisenberg circuits must be unitary and have no classical bits.")
+        if nodes is not None and (not self.simulation or self.fakebackend):
+            target_backend = self.real_backend if self.real_backend is not None else self.backend
+            if circuit.num_qubits > target_backend.num_qubits:
+                raise ValueError("Fixed circuit is wider than the target backend.")
+            for inst in circuit.data:
+                if inst.operation.name == "barrier":
+                    continue
+                qargs = tuple(circuit.find_bit(q).index for q in inst.qubits)
+                if not target_backend.target.instruction_supported(
+                    operation_name=inst.operation.name, qargs=qargs,
+                    parameters=list(inst.operation.params),
+                ):
+                    raise ValueError(
+                        f"Fixed transpiled circuit instruction {inst.operation.name}{qargs} "
+                        "is incompatible with the target backend. Load the logical QPY to transpile again."
+                    )
 
     def _transpile_or_load_circuit(self, qc_param: QuantumCircuit, *, persist_artifacts: bool = False):
-        """Transpile/load the Heisenberg circuit following the notebook semantics."""
-        qpy_path = None
-        if persist_artifacts:
-            Path(self.base_folder).mkdir(parents=True, exist_ok=True)
-            qpy_path = Path(self.base_folder) / "heisenberg_circuit.qpy"
-
+        """Compile logical QPYs or preserve compatible physical QPYs and their layout."""
+        source = qc_param
         if self.fixed_circuit_file_name:
-            fixed_path = Path(self.fixed_circuit_file_name)
-            if fixed_path.suffix != ".qpy":
-                fixed_path = fixed_path.with_suffix(".qpy")
-            with open(fixed_path, "rb") as f:
-                qc_t = qpy.load(f)[0]
-            return qc_t
+            source = self._read_fixed_circuit()
+            self._validate_fixed_circuit(source, qc_param)
 
-        if not self.simulation:
-            if self.use_fixed_phys_nodes and self.phys_nodes is not None:
-                initial_layout = Layout({qc_param.qubits[i]: self.phys_nodes[i] for i in range(self.q_enc)})
-                qc_t = transpile(
-                    qc_param,
-                    backend=self.backend,
-                    initial_layout=initial_layout,
-                    optimization_level=3,
-                    seed_transpiler=self.seed,
-                )
-            else:
-                qc_t = transpile(
-                    qc_param,
-                    backend=self.backend,
-                    optimization_level=3,
-                    seed_transpiler=self.seed,
-                )
-                extracted = _extract_initial_phys_nodes(qc_t, qc_param)
-                if extracted is not None:
-                    self.phys_nodes = extracted
-                    if persist_artifacts:
-                        save_json(self.phys_nodes, Path(self.base_folder) / "phys_nodes.json")
-
-            if persist_artifacts:
-                with open(qpy_path, "wb") as f:
-                    qpy.dump(qc_t, f)
-
+        if self.fixed_circuit_file_name and source.layout is not None:
+            qc_t = source
+        elif not self.simulation or self.fakebackend:
+            initial_layout = None
+            if (self.use_fixed_phys_nodes or self.topology == "native") and self.phys_nodes is not None:
+                initial_layout = Layout({source.qubits[i]: self.phys_nodes[i] for i in range(self.q_enc)})
+            qc_t = transpile(
+                source, backend=self.backend, initial_layout=initial_layout,
+                optimization_level=3, seed_transpiler=self.seed,
+            )
+            extracted = _extract_initial_phys_nodes(qc_t, source)
+            if extracted is not None:
+                self.phys_nodes = extracted
+        elif self.fixed_circuit_file_name or self.framework == "cudaq":
+            qc_t = source.copy()
         else:
-            if self.fakebackend:
-                if self.use_fixed_phys_nodes and self.phys_nodes is not None:
-                    initial_layout = Layout({qc_param.qubits[i]: self.phys_nodes[i] for i in range(self.q_enc)})
-                    qc_t = transpile(
-                        qc_param,
-                        backend=self.backend,
-                        initial_layout=initial_layout,
-                        optimization_level=3,
-                        seed_transpiler=self.seed,
-                    )
-                else:
-                    qc_t = transpile(
-                        qc_param,
-                        backend=self.backend,
-                        optimization_level=3,
-                        seed_transpiler=self.seed,
-                    )
-            elif self.framework == "cudaq":
-                qc_t = qc_param.copy()
-            else:
-                pm = generate_preset_pass_manager(
-                    optimization_level=3,
-                    backend=self.backend,
-                    seed_transpiler=self.seed,
-                )
-                qc_t = pm.run(qc_param)
+            pm = generate_preset_pass_manager(
+                optimization_level=3, backend=self.backend, seed_transpiler=self.seed,
+            )
+            qc_t = pm.run(source)
 
-        if persist_artifacts and self.save_circuit_drawings:
-            save_circuit_draw(qc_t, self.base_folder, "heisenberg_circuit_transpiled")
-            save_circuit_draw(qc_param, self.base_folder, "heisenberg_circuit_logical")
-
+        if persist_artifacts:
+            folder = Path(self.base_folder)
+            folder.mkdir(parents=True, exist_ok=True)
+            with (folder / "heisenberg_circuit.qpy").open("wb") as stream:
+                qpy.dump(qc_t, stream)
+            if source.layout is None:
+                with (folder / "heisenberg_circuit_logical.qpy").open("wb") as stream:
+                    qpy.dump(source, stream)
+            if self.phys_nodes is not None:
+                save_json(self.phys_nodes, folder / "phys_nodes.json")
+            if self.save_circuit_drawings:
+                save_circuit_draw(qc_t, self.base_folder, "heisenberg_circuit_transpiled")
+                save_circuit_draw(source, self.base_folder, "heisenberg_circuit_logical")
         return qc_t
 
     def execute_quantum_feature_map(self):
         theta_values_all, self.theta_info = make_heisenberg_theta_matrix(
             self.X_q_all,
             self.q_enc,
-            features_per_block=self.q_enc - 1,
+            edges_act=self._encoding_edges(),
+            interaction_axes=self.interaction_axes,
+            encoding_mode=self.encoding_mode,
             use_tanh_scaling=self.use_tanh_scaling,
         )
 
         qc_param, param_order, obs_list, obs_metadata = self._build_circuit_and_observables()
 
-        qc_t = self._transpile_or_load_circuit(qc_param)
+        qc_t = self._transpile_or_load_circuit(qc_param, persist_artifacts=self.base_folder is not None)
+        validate_circuit_parameter_compatibility(qc_t, param_order)
 
         if not self.simulation:
             test_circuit_t(
@@ -518,7 +724,7 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
             if self.resource_estimation:
                 return None
 
-        if not self.simulation or self.fakebackend:
+        if qc_t.layout is not None:
             obs_isa = [obs.apply_layout(qc_t.layout) for obs in obs_list]
         else:
             obs_isa = obs_list
@@ -526,6 +732,17 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
 
         metadata_extra = {
             "q_enc": int(self.q_enc),
+            "topology": self.topology,
+            "interaction_axes": list(self.interaction_axes),
+            "encoding_mode": self.encoding_mode,
+            "edges_act": [list(edge) for edge in self.edges_act],
+            "measure_2local_diagonal": bool(self.measure_2local_diagonal),
+            "measure_cross_observables": bool(self.measure_cross_observables),
+            "num_features": int(self.theta_info["num_features"]),
+            "parameter_names": [p.name for p in param_order],
+            "circuit_parameter_names": [p.name for p in qc_t.parameters],
+            "fixed_circuit_loaded": bool(self.fixed_circuit_file_name),
+            "circuit_encoding": (qc_t.metadata or {}).get("pqfmlib_heisenberg"),
             "R": int(self.R),
             "alpha": float(self.alpha),
             "phi_scale": float(self.circuit_info["phi_scale"]),
@@ -536,6 +753,13 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
         }
         if self.phys_nodes is not None:
             metadata_extra["phys_nodes"] = [int(x) for x in self.phys_nodes]
+
+        if qc_t.layout is not None:
+            metadata_extra["final_phys_nodes"] = qc_t.layout.final_index_layout(filter_ancillas=True)
+        if self.base_folder is not None:
+            self.metadata_output_path = str(Path(self.base_folder) / "heisenberg_metadata.json")
+            save_json({**metadata_extra, "obs_metadata": [list(item) for item in obs_metadata]},
+                      self.metadata_output_path)
 
         if self.simulation:
             prepared = PreparedProjectedFeatureJob(
@@ -573,10 +797,16 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
         np.save(self.npy_output_path, self.Xq_all_raw)
 
     def run(self):
+        self._validate_topology()
+        self._validate_encoding()
         self.load_data()
         self.setup_backend_and_estimator()
-        self.prepare_output_folder()
-        self.prepare_layout()
+        if self.topology == "chain":
+            self.prepare_output_folder()
+            self.prepare_layout()
+        else:
+            self.prepare_layout()
+            self.prepare_output_folder()
         result = self.execute_quantum_feature_map()
         if not self.simulation:
             return result
@@ -589,6 +819,7 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
             "csv_path": self.csv_output_path,
             "npy_path": self.npy_output_path,
             "base_folder": self.base_folder,
+            "metadata_path": self.metadata_output_path,
             "theta_info": self.theta_info,
             "circuit_info": self.circuit_info,
         }

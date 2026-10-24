@@ -10,14 +10,14 @@ import tilelang.language as T
 
 
 @tilelang.jit(target="cuda", execution_backend="tvm_ffi")
-def _local_expectations(angles: int, qubits: int, max_ops: int):
+def _local_expectations(batch_rows: int, angles: int, qubits: int, max_ops: int):
     @T.prim_func
-    def kernel(phases: T.Tensor((angles, 2), "float64"),
+    def kernel(phases: T.Tensor((batch_rows, angles, 2), "float64"),
                instructions: T.Tensor((qubits, max_ops, 4), "int32"),
                widths: T.Tensor((qubits,), "int32"),
                targets: T.Tensor((qubits,), "int32"),
-               out: T.Tensor((qubits, 128, 3), "float64")):
-        with T.Kernel(qubits, threads=128) as site:
+               out: T.Tensor((batch_rows, qubits, 128, 3), "float64")):
+        with T.Kernel(batch_rows, qubits, threads=128) as (row, site):
             thread = T.get_thread_binding()
             state = T.alloc_shared((2, 256, 2), "float64")
             for slot in T.Parallel(2):
@@ -37,7 +37,7 @@ def _local_expectations(angles: int, qubits: int, max_ops: int):
                     peer = item + (1 - 2 * bit) * (1 << shift)
                     ar, ai = state[read_side, item, 0], state[read_side, item, 1]
                     br, bi = state[read_side, peer, 0], state[read_side, peer, 1]
-                    c, s = phases[parameter, 0], phases[parameter, 1]
+                    c, s = phases[row, parameter, 0], phases[row, parameter, 1]
                     rz_r = ar * c - ai * (2 * bit - 1) * s
                     rz_i = ar * (2 * bit - 1) * s + ai * c
                     sx_r, sx_i = (ar - ai + br + bi) * 0.5, (ar + ai - br + bi) * 0.5
@@ -64,11 +64,11 @@ def _local_expectations(angles: int, qubits: int, max_ops: int):
             ar, ai = state[side, zero, 0], state[side, zero, 1]
             br, bi = state[side, one, 0], state[side, one, 1]
             valid = pair < (1 << (width - 1))
-            out[site, thread, 0] = T.if_then_else(
+            out[row, site, thread, 0] = T.if_then_else(
                 valid, ar * ar + ai * ai - br * br - bi * bi, 0.0)
-            out[site, thread, 1] = T.if_then_else(
+            out[row, site, thread, 1] = T.if_then_else(
                 valid, 2 * (ar * br + ai * bi), 0.0)
-            out[site, thread, 2] = T.if_then_else(
+            out[row, site, thread, 2] = T.if_then_else(
                 valid, 2 * (ar * bi - ai * br), 0.0)
     return kernel
 
@@ -124,7 +124,7 @@ def _build_plan(circuit, parameters):
 class HeisenbergTileLang:
     """Evolve exact local complex128 statevectors and return site-major means."""
 
-    def __init__(self, circuit, parameters, *, device="cuda"):
+    def __init__(self, circuit, parameters, *, device="cuda", batch_rows=64):
         self.device = torch.device(device)
         if self.device.type != "cuda" or not torch.cuda.is_available():
             raise ValueError("A CUDA device is required")
@@ -137,6 +137,9 @@ class HeisenbergTileLang:
         if (self.plan.get("schema") != "chain-statevector-v1"
                 or self.plan.get("noise") is not False or self.plan.get("repetitions") != 2):
             raise ValueError("Expected an R=2 noiseless chain statevector plan")
+        if batch_rows < 1:
+            raise ValueError("batch_rows must be positive")
+        self.batch_rows = batch_rows
         self.n_qubits = self.plan["qubits"]
         cones = []
         gate_kinds = {"rz": 0, "sx": 1, "x": 2, "cz": 3}
@@ -179,66 +182,68 @@ class HeisenbergTileLang:
         self.instructions = instructions
         self.widths = torch.tensor(widths, dtype=torch.int32, device=self.device)
         self.targets = torch.tensor(targets, dtype=torch.int32, device=self.device)
-        self.local_expectations = _local_expectations(
-            len(self.plan["columns"]), self.n_qubits, self.max_ops)
-        self.partial = torch.empty((self.n_qubits, 128, 3), dtype=torch.float64,
-                                   device=self.device)
+        self.kernels = {}
+        self._kernel_for(batch_rows)
+
+    def _kernel_for(self, batch_rows):
+        if batch_rows not in self.kernels:
+            kernel = _local_expectations(
+                batch_rows, len(self.plan["columns"]), self.n_qubits, self.max_ops)
+            partial = torch.empty((batch_rows, self.n_qubits, 128, 3),
+                                  dtype=torch.float64, device=self.device)
+            self.kernels[batch_rows] = kernel, partial
+        return self.kernels[batch_rows]
 
     def inspect_kernels(self, rows=None):
-        sizes = [len(self.local_expectations.get_kernel_source())]
+        kernel, _ = self._kernel_for(self.batch_rows)
+        sizes = [len(kernel.get_kernel_source())]
         if max(sizes) > 20000:
             raise RuntimeError("Unexpected generated CUDA kernel")
         return {"kernel_source_bytes": sizes, "threads_per_kernel": [128],
-                "blocks": [self.n_qubits], "cone_widths": self.cone_widths,
+                "blocks": [self.batch_rows, self.n_qubits],
+                "cone_widths": self.cone_widths,
                 "max_local_operations": self.max_ops}
+
+    def _phases(self, features):
+        theta = 2 * torch.pi * torch.tanh(features / 3)
+        coefficients = self.plan["coefficients"]
+        angles = (theta[:, self.plan["columns"]] * coefficients[:, 0]
+                  + coefficients[:, 1]) / 2
+        return torch.stack((torch.cos(angles), torch.sin(angles)), dim=-1)
+
+    def _run_batch(self, features):
+        count = len(features)
+        if count < self.batch_rows:
+            padding = features[-1:].expand(self.batch_rows - count, -1)
+            features = torch.cat((features, padding), dim=0)
+        phases = self._phases(features)
+        kernel, partial = self._kernel_for(self.batch_rows)
+        kernel(phases, self.instructions, self.widths, self.targets, partial)
+        return partial.sum(dim=2).flatten(start_dim=1)[:count]
 
     def evolve(self, features):
         if (not isinstance(features, torch.Tensor) or features.shape != (self.plan["features"],)
                 or features.dtype != torch.float64 or features.device != self.device):
             raise ValueError(f"Expected CUDA float64 features ({self.plan['features']},) on {self.device}")
-        theta = 2 * torch.pi * torch.tanh(features / 3)
-        coefficients = self.plan["coefficients"]
-        angles = (theta[self.plan["columns"]] * coefficients[:, 0] + coefficients[:, 1]) / 2
-        phases = torch.stack((torch.cos(angles), torch.sin(angles)), dim=-1)
-        self.phases = phases
+        self.phases = self._phases(features.unsqueeze(0))
         return self
 
     def exact_expectations(self):
-        self.local_expectations(self.phases, self.instructions, self.widths,
-                                self.targets, self.partial)
-        return self.partial.sum(dim=1).flatten()
+        kernel, partial = self._kernel_for(1)
+        kernel(self.phases, self.instructions, self.widths, self.targets, partial)
+        return partial[0].sum(dim=1).flatten()
 
     def transform(self, features):
         """Transform host feature rows into host float64 Z/X/Y expectations."""
         inputs = torch.as_tensor(features, dtype=torch.float64, device=self.device)
         if inputs.ndim != 2 or inputs.shape[1] != self.plan["features"] or not len(inputs):
             raise ValueError(f"Expected nonempty feature rows with {self.plan['features']} columns")
-        if not hasattr(self, "_graph"):
-            self._capture_transform()
         outputs = torch.empty((len(inputs), self.n_qubits * 3),
                               dtype=torch.float64, device=self.device)
-        for row, output in zip(inputs, outputs):
-            self._graph_features.copy_(row)
-            self._graph.replay()
-            output.copy_(self._graph_output)
+        for start in range(0, len(inputs), self.batch_rows):
+            end = min(start + self.batch_rows, len(inputs))
+            outputs[start:end] = self._run_batch(inputs[start:end])
         return outputs.cpu().numpy()
-
-    def _capture_transform(self):
-        """Capture the fixed gate schedule to avoid per-gate host launches."""
-        self._graph_features = torch.zeros(self.plan["features"], dtype=torch.float64,
-                                           device=self.device)
-        stream = torch.cuda.Stream(device=self.device)
-        stream.wait_stream(torch.cuda.current_stream(self.device))
-        with torch.cuda.stream(stream):
-            # Populate the CUDA and TileLang caches before capture.
-            self.evolve(self._graph_features)
-            self.exact_expectations()
-        stream.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            self.evolve(self._graph_features)
-            self._graph_output = self.exact_expectations()
-        self._graph = graph
 
     def __call__(self, features):
         return self.evolve(features).exact_expectations()

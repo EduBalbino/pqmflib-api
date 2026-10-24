@@ -1,0 +1,12 @@
+assert_lefthook_installed: true
+no_auto_install: true
+pre-commit:
+  commands:
+    performance:
+      glob: "{pqfmlib/experimental/*.py,pqfmlib/maps/heisenberg.py,pqfmlib/core/{cudaq_execution,execution,framework,observables}.py,experiments/sia/{benchmark_heisenberg,heisenberg_model,heisenberg_reference}.py}"
+      run: just check
+post-commit:
+  commands:
+    accept-measurement:
+      glob: "{pqfmlib/experimental/*.py,pqfmlib/maps/heisenberg.py,pqfmlib/core/{cudaq_execution,execution,framework,observables}.py,experiments/sia/{benchmark_heisenberg,heisenberg_model,heisenberg_reference}.py}"
+      run: just accept

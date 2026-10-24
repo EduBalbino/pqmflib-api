@@ -10,66 +10,67 @@ import tilelang.language as T
 
 
 @tilelang.jit(target="cuda", execution_backend="tvm_ffi")
-def _local_expectations(batch_rows: int, angles: int, qubits: int, max_ops: int):
+def _local_expectations(batch_rows: int, exchanges: int, sites: int,
+                        width: int, max_ops: int):
     @T.prim_func
-    def kernel(phases: T.Tensor((batch_rows, angles, 2), "float64"),
-               instructions: T.Tensor((qubits, max_ops, 4), "int32"),
-               widths: T.Tensor((qubits,), "int32"),
-               targets: T.Tensor((qubits,), "int32"),
-               out: T.Tensor((batch_rows, qubits, 128, 3), "float64")):
-        with T.Kernel(batch_rows, qubits, threads=128) as (row, site):
+    def kernel(phases: T.Tensor((batch_rows, exchanges, 8), "float64"),
+               instructions: T.Tensor((sites, max_ops, 3), "int32"),
+               op_counts: T.Tensor((sites,), "int32"),
+               targets: T.Tensor((sites,), "int32"),
+               initial_states: T.Tensor((sites, 1 << width, 2), "float64"),
+               out: T.Tensor((batch_rows, sites, 1 << (width - 1), 3), "float64")):
+        with T.Kernel(batch_rows, sites, threads=1 << (width - 1)) as (row, site):
             thread = T.get_thread_binding()
-            state = T.alloc_shared((2, 256, 2), "float64")
-            for slot in T.Parallel(2):
-                for item in T.Parallel(256):
-                    state[0, item, slot] = T.if_then_else(
-                        (item == 0) & (slot == 0), 1.0, 0.0)
+            state = T.alloc_shared((2, 1 << width, 2), "float64")
+            for item in T.Parallel(1 << width):
+                state[0, item, 0] = initial_states[site, item, 0]
+                state[0, item, 1] = initial_states[site, item, 1]
             T.sync_threads()
-            for op in T.serial(max_ops):
-                kind = instructions[site, op, 0]
-                shift = instructions[site, op, 1]
-                other_shift = instructions[site, op, 2]
-                parameter = instructions[site, op, 3]
+            op_count = op_counts[site]
+            for op in T.serial(op_count):
+                shift = instructions[site, op, 0]
+                other_shift = instructions[site, op, 1]
+                parameter = instructions[site, op, 2]
                 read_side = op & 1
                 write_side = 1 - read_side
-                for item in T.Parallel(256):
+                for item in T.Parallel(1 << width):
                     bit = (item >> shift) & 1
-                    peer = item + (1 - 2 * bit) * (1 << shift)
+                    other_bit = (item >> other_shift) & 1
+                    odd = bit ^ other_bit
+                    exchange_peer = item ^ (1 << shift) ^ (1 << other_shift)
                     ar, ai = state[read_side, item, 0], state[read_side, item, 1]
-                    br, bi = state[read_side, peer, 0], state[read_side, peer, 1]
-                    c, s = phases[row, parameter, 0], phases[row, parameter, 1]
-                    rz_r = ar * c - ai * (2 * bit - 1) * s
-                    rz_i = ar * (2 * bit - 1) * s + ai * c
-                    sx_r, sx_i = (ar - ai + br + bi) * 0.5, (ar + ai - br + bi) * 0.5
-                    sign = 1 - 2 * bit * ((item >> other_shift) & 1)
-                    state[write_side, item, 0] = T.if_then_else(
-                        kind == 0, rz_r,
-                        T.if_then_else(kind == 1, sx_r,
-                                       T.if_then_else(kind == 2, br,
-                                                      T.if_then_else(kind == 3, sign * ar, ar))))
-                    state[write_side, item, 1] = T.if_then_else(
-                        kind == 0, rz_i,
-                        T.if_then_else(kind == 1, sx_i,
-                                       T.if_then_else(kind == 2, bi,
-                                                      T.if_then_else(kind == 3, sign * ai, ai))))
+                    exchange_br = state[read_side, exchange_peer, 0]
+                    exchange_bi = state[read_side, exchange_peer, 1]
+                    exchange_parameter = parameter
+                    exchange_c_r = T.if_then_else(
+                        odd == 0, phases[row, exchange_parameter, 0],
+                        phases[row, exchange_parameter, 4])
+                    exchange_c_i = T.if_then_else(
+                        odd == 0, phases[row, exchange_parameter, 1],
+                        phases[row, exchange_parameter, 5])
+                    exchange_d_r = T.if_then_else(
+                        odd == 0, phases[row, exchange_parameter, 2],
+                        phases[row, exchange_parameter, 6])
+                    exchange_d_i = T.if_then_else(
+                        odd == 0, phases[row, exchange_parameter, 3],
+                        phases[row, exchange_parameter, 7])
+                    state[write_side, item, 0] = (exchange_c_r * ar - exchange_c_i * ai
+                                                  + exchange_d_r * exchange_br - exchange_d_i * exchange_bi)
+                    state[write_side, item, 1] = (exchange_c_r * ai + exchange_c_i * ar
+                                                  + exchange_d_r * exchange_bi + exchange_d_i * exchange_br)
                 T.sync_threads()
 
-            width = widths[site]
             target = targets[site]
             pair = thread
             stride = 1 << target
             zero = (pair >> target << (target + 1)) + (pair & (stride - 1))
             one = zero + stride
-            side = max_ops & 1
+            side = op_count & 1
             ar, ai = state[side, zero, 0], state[side, zero, 1]
             br, bi = state[side, one, 0], state[side, one, 1]
-            valid = pair < (1 << (width - 1))
-            out[row, site, thread, 0] = T.if_then_else(
-                valid, ar * ar + ai * ai - br * br - bi * bi, 0.0)
-            out[row, site, thread, 1] = T.if_then_else(
-                valid, 2 * (ar * br + ai * bi), 0.0)
-            out[row, site, thread, 2] = T.if_then_else(
-                valid, 2 * (ar * bi - ai * br), 0.0)
+            out[row, site, thread, 0] = ar * ar + ai * ai - br * br - bi * bi
+            out[row, site, thread, 1] = 2 * (ar * br + ai * bi)
+            out[row, site, thread, 2] = 2 * (ar * bi - ai * br)
     return kernel
 
 
@@ -83,41 +84,74 @@ def _build_plan(circuit, parameters):
             or metadata.get("interaction_axes") != ["x", "y", "z"]):
         raise ValueError("Expected the complete R=2 multi-axis logical circuit")
     seed, alpha = metadata["seed"], metadata["alpha"]
-    from qiskit import transpile
-    circuit = transpile(circuit, basis_gates=["rz", "sx", "x", "cz"],
-                        optimization_level=0, seed_transpiler=seed)
     operations, coefficients, columns = [], [], []
-    for instruction in circuit.data:
+    unitaries = torch.empty((qubits, 2, 2, 2), dtype=torch.float64)
+    data = circuit.data
+    index = 0
+    while index < len(data):
+        instruction = data[index]
         gate = instruction.operation
         sites = tuple(circuit.find_bit(q).index for q in instruction.qubits)
-        if gate.name == "rz":
-            expression = gate.params[0]
-            column, slope = 0, 0.0
-            if isinstance(expression, ParameterExpression) and expression.parameters:
-                if len(expression.parameters) != 1:
-                    raise ValueError("Expected a single affine feature parameter")
-                parameter = next(iter(expression.parameters))
-                column = parameters.index(parameter)
-                slope = float(expression.gradient(parameter))
-                offset = float(expression.bind({parameter: 0}))
-            else:
-                offset = float(expression)
-            operations.append((gate.name, sites, len(coefficients)))
-            coefficients.append((slope, offset))
-            columns.append(column)
-        elif gate.name in ("sx", "x", "cz", "id"):
+
+        if gate.name == "unitary":
+            matrix = gate.to_matrix()
+            unitaries[sites[0], :, :, 0] = torch.as_tensor(matrix.real)
+            unitaries[sites[0], :, :, 1] = torch.as_tensor(matrix.imag)
+            index += 1
+            continue
+
+        if gate.name == "rzz":
+            triple = data[index:index + 3]
+            names = [item.operation.name for item in triple]
+            if names != ["rzz", "rxx", "ryy"]:
+                raise ValueError("Expected each edge interaction as RZZ, RXX, RYY")
+            edge = tuple(circuit.find_bit(q).index for q in triple[0].qubits)
+            if any(tuple(circuit.find_bit(q).index for q in item.qubits) != edge
+                   for item in triple):
+                raise ValueError("Expected the three Pauli rotations on the same edge")
+            by_axis = {}
+            for item in triple:
+                axis = {"rzz": "z", "rxx": "x", "ryy": "y"}[item.operation.name]
+                expression = item.operation.params[0]
+                column, slope = 0, 0.0
+                if isinstance(expression, ParameterExpression) and expression.parameters:
+                    if len(expression.parameters) != 1:
+                        raise ValueError("Expected a single affine feature parameter")
+                    parameter = next(iter(expression.parameters))
+                    column = parameters.index(parameter)
+                    slope = float(expression.gradient(parameter))
+                    offset = float(expression.bind({parameter: 0}))
+                else:
+                    offset = float(expression)
+                by_axis[axis] = (column, slope, offset)
+            pair_parameters = [by_axis[axis] for axis in ("x", "y", "z")]
+            operations.append(("exchange", edge, len(coefficients)))
+            columns.append([parameter[0] for parameter in pair_parameters])
+            coefficients.append([[parameter[1], parameter[2]]
+                                 for parameter in pair_parameters])
+            index += 3
+            continue
+
+        if gate.name in ("rxx", "ryy"):
+            raise ValueError("Pauli rotations must begin with an RZZ interaction")
+        if gate.name == "barrier":
+            index += 1
+            continue
+        if gate.name in ("sx", "x", "cz", "id"):
             if len(sites) == 2 and abs(sites[0] - sites[1]) != 1:
                 raise ValueError("Expected adjacent chain sites")
-            operations.append((gate.name, sites, -1))
+            raise ValueError(f"Unexpected native gate in logical plan: {gate.name}")
         else:
-            raise ValueError(f"Unsupported decomposed gate {gate.name}")
+            raise ValueError(f"Unsupported logical gate {gate.name}")
+        index += 1
     return {
-        "schema": "chain-statevector-v1", "qubits": qubits, "seed": seed,
+        "schema": "chain-statevector-v3", "qubits": qubits, "seed": seed,
         "alpha": alpha, "repetitions": 2, "noise": False,
         "features": len(parameters), "encoding_mode": "multi_axis",
         "operations": operations,
         "coefficients": torch.tensor(coefficients, dtype=torch.float64),
         "columns": torch.tensor(columns, dtype=torch.int64),
+        "unitaries": unitaries,
     }
 
 
@@ -134,7 +168,7 @@ class HeisenbergTileLang:
             key: value.to(self.device) if isinstance(value, torch.Tensor) else value
             for key, value in _build_plan(circuit, parameters).items()
         }
-        if (self.plan.get("schema") != "chain-statevector-v1"
+        if (self.plan.get("schema") != "chain-statevector-v3"
                 or self.plan.get("noise") is not False or self.plan.get("repetitions") != 2):
             raise ValueError("Expected an R=2 noiseless chain statevector plan")
         if batch_rows < 1:
@@ -142,74 +176,112 @@ class HeisenbergTileLang:
         self.batch_rows = batch_rows
         self.n_qubits = self.plan["qubits"]
         cones = []
-        gate_kinds = {"rz": 0, "sx": 1, "x": 2, "cz": 3}
         for target in range(self.n_qubits):
             active = {target}
             retained = []
             for name, sites, parameter in reversed(self.plan["operations"]):
-                if name == "id":
+                if name == "unitary":
                     continue
-                if len(sites) == 1:
-                    if sites[0] in active:
-                        retained.append((gate_kinds[name], sites[0], -1,
-                                         max(parameter, 0)))
-                elif any(site in active for site in sites):
+                if name != "exchange" or len(sites) != 2:
+                    raise ValueError(f"Unexpected operation in logical plan: {name}")
+                if any(site in active for site in sites):
                     active.update(sites)
-                    retained.append((gate_kinds[name], sites[0], sites[1], -1))
+                    retained.append((sites[0], sites[1], parameter))
             local_sites = sorted(active)
             local_index = {site: index for index, site in enumerate(local_sites)}
             operations = []
-            for kind, first, second, parameter in reversed(retained):
+            for first, second, parameter in reversed(retained):
                 shift = local_index[first]
-                other_shift = local_index[second] if second >= 0 else 0
-                operations.append((kind, shift, other_shift, parameter))
-            cones.append((len(local_sites), local_index[target], operations))
+                other_shift = local_index[second]
+                operations.append((shift, other_shift, parameter))
 
-        self.cone_widths = [width for width, _, _ in cones]
+            basis = torch.arange(1 << len(local_sites), dtype=torch.int64, device=self.device)
+            real = torch.ones((len(basis),), dtype=torch.float64, device=self.device)
+            imag = torch.zeros_like(real)
+            for local, physical in enumerate(local_sites):
+                bit = (basis >> local) & 1
+                unitary = self.plan["unitaries"][physical]
+                factor_r = torch.where(bit == 0, unitary[0, 0, 0], unitary[1, 0, 0])
+                factor_i = torch.where(bit == 0, unitary[0, 0, 1], unitary[1, 0, 1])
+                real, imag = real * factor_r - imag * factor_i, real * factor_i + imag * factor_r
+            initial_state = torch.stack((real, imag), dim=-1)
+            cones.append((len(local_sites), local_index[target], operations,
+                          local_sites, initial_state))
+
+        self.cone_widths = [cone[0] for cone in cones]
         if max(self.cone_widths) > 8:
             raise ValueError("Exact local statevector kernels support causal cones up to 8 qubits")
-        self.max_ops = max(len(operations) for _, _, operations in cones)
-        instructions = torch.zeros((self.n_qubits, self.max_ops, 4),
-                                   dtype=torch.int32, device=self.device)
-        instructions[:, :, 0].fill_(4)
-        widths, targets = [], []
-        for site, (width, target, operations) in enumerate(cones):
-            widths.append(width)
-            targets.append(target)
-            if operations:
-                instructions[site, :len(operations)] = torch.tensor(
-                    operations, dtype=torch.int32, device=self.device)
-        self.instructions = instructions
-        self.widths = torch.tensor(widths, dtype=torch.int32, device=self.device)
-        self.targets = torch.tensor(targets, dtype=torch.int32, device=self.device)
+        self.groups = {}
+        for width in sorted(set(self.cone_widths)):
+            site_ids = [site for site, cone in enumerate(cones) if cone[0] == width]
+            max_ops = max(len(cones[site][2]) for site in site_ids)
+            instructions = torch.zeros((len(site_ids), max_ops, 3),
+                                       dtype=torch.int32, device=self.device)
+            targets, op_counts, initial_states = [], [], []
+            for local_site, site in enumerate(site_ids):
+                _, target, operations, _, initial_state = cones[site]
+                targets.append(target)
+                op_counts.append(len(operations))
+                initial_states.append(initial_state)
+                if operations:
+                    instructions[local_site, :len(operations)] = torch.tensor(
+                        operations, dtype=torch.int32, device=self.device)
+            self.groups[width] = {
+                "sites": torch.tensor(site_ids, dtype=torch.int64, device=self.device),
+                "instructions": instructions,
+                "op_counts": torch.tensor(op_counts, dtype=torch.int32, device=self.device),
+                "targets": torch.tensor(targets, dtype=torch.int32, device=self.device),
+                "initial_states": torch.stack(initial_states),
+                "max_ops": max_ops,
+            }
         self.kernels = {}
-        self._kernel_for(batch_rows)
+        for width in self.groups:
+            self._kernel_for(batch_rows, width)
 
-    def _kernel_for(self, batch_rows):
-        if batch_rows not in self.kernels:
+    def _kernel_for(self, batch_rows, width):
+        key = (batch_rows, width)
+        if key not in self.kernels:
+            group = self.groups[width]
             kernel = _local_expectations(
-                batch_rows, len(self.plan["columns"]), self.n_qubits, self.max_ops)
-            partial = torch.empty((batch_rows, self.n_qubits, 128, 3),
+                batch_rows, len(self.plan["columns"]), len(group["sites"]),
+                width, group["max_ops"])
+            partial = torch.empty((batch_rows, len(group["sites"]),
+                                   1 << (width - 1), 3),
                                   dtype=torch.float64, device=self.device)
-            self.kernels[batch_rows] = kernel, partial
-        return self.kernels[batch_rows]
+            self.kernels[key] = kernel, partial
+        return self.kernels[key]
 
     def inspect_kernels(self, rows=None):
-        kernel, _ = self._kernel_for(self.batch_rows)
-        sizes = [len(kernel.get_kernel_source())]
+        sizes = [len(self._kernel_for(self.batch_rows, width)[0].get_kernel_source())
+                 for width in self.groups]
         if max(sizes) > 20000:
             raise RuntimeError("Unexpected generated CUDA kernel")
-        return {"kernel_source_bytes": sizes, "threads_per_kernel": [128],
-                "blocks": [self.batch_rows, self.n_qubits],
+        return {"kernel_source_bytes": sizes,
+                "threads_per_kernel": [1 << (width - 1) for width in self.groups],
+                "blocks": [(self.batch_rows, len(group["sites"]))
+                           for group in self.groups.values()],
                 "cone_widths": self.cone_widths,
-                "max_local_operations": self.max_ops}
+                "max_local_operations": [group["max_ops"]
+                                          for group in self.groups.values()]}
 
     def _phases(self, features):
         theta = 2 * torch.pi * torch.tanh(features / 3)
         coefficients = self.plan["coefficients"]
-        angles = (theta[:, self.plan["columns"]] * coefficients[:, 0]
-                  + coefficients[:, 1]) / 2
-        return torch.stack((torch.cos(angles), torch.sin(angles)), dim=-1)
+        angles = (theta[:, self.plan["columns"]] * coefficients[:, :, 0]
+                  + coefficients[:, :, 1])
+        x, y, z = angles.unbind(dim=2)
+        half_z = z / 2
+        even = (x - y) / 2
+        odd = (x + y) / 2
+        cos_z, sin_z = torch.cos(half_z), torch.sin(half_z)
+        cos_even, sin_even = torch.cos(even), torch.sin(even)
+        cos_odd, sin_odd = torch.cos(odd), torch.sin(odd)
+        return torch.stack((
+            cos_z * cos_even, -sin_z * cos_even,
+            -sin_z * sin_even, -cos_z * sin_even,
+            cos_z * cos_odd, sin_z * cos_odd,
+            sin_z * sin_odd, -cos_z * sin_odd,
+        ), dim=-1)
 
     def _run_batch(self, features):
         count = len(features)
@@ -217,9 +289,14 @@ class HeisenbergTileLang:
             padding = features[-1:].expand(self.batch_rows - count, -1)
             features = torch.cat((features, padding), dim=0)
         phases = self._phases(features)
-        kernel, partial = self._kernel_for(self.batch_rows)
-        kernel(phases, self.instructions, self.widths, self.targets, partial)
-        return partial.sum(dim=2).flatten(start_dim=1)[:count]
+        outputs = torch.empty((self.batch_rows, self.n_qubits, 3),
+                              dtype=torch.float64, device=self.device)
+        for width, group in self.groups.items():
+            kernel, partial = self._kernel_for(self.batch_rows, width)
+            kernel(phases, group["instructions"], group["op_counts"], group["targets"],
+                   group["initial_states"], partial)
+            outputs[:, group["sites"]] = partial.sum(dim=2)
+        return outputs.flatten(start_dim=1)[:count]
 
     def evolve(self, features):
         if (not isinstance(features, torch.Tensor) or features.shape != (self.plan["features"],)
@@ -229,9 +306,13 @@ class HeisenbergTileLang:
         return self
 
     def exact_expectations(self):
-        kernel, partial = self._kernel_for(1)
-        kernel(self.phases, self.instructions, self.widths, self.targets, partial)
-        return partial[0].sum(dim=1).flatten()
+        outputs = torch.empty((self.n_qubits, 3), dtype=torch.float64, device=self.device)
+        for width, group in self.groups.items():
+            kernel, partial = self._kernel_for(1, width)
+            kernel(self.phases, group["instructions"], group["op_counts"], group["targets"],
+                   group["initial_states"], partial)
+            outputs[group["sites"]] = partial[0].sum(dim=1)
+        return outputs.flatten()
 
     def transform(self, features):
         """Transform host feature rows into host float64 Z/X/Y expectations."""

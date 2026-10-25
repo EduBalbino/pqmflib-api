@@ -24,6 +24,11 @@ dependencies = [
 cudaq = [
   "cuda-quantum-cu12>=0.16,<0.17",
 ]
+gpu = [
+  "torch>=2.8,<2.12",
+  "tilelang>=0.1.15,<0.2",
+  "pyarrow>=25",
+]
 examples = [
   "shap>=0.45",
   "matplotlib>=3.10.9",

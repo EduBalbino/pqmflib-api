@@ -24,6 +24,9 @@ outputs/
 tests/*
 !tests/test_heisenberg_topology.py
 !tests/test_heisenberg_fixed_circuits.py
+!tests/test_superexchange.py
+!tests/test_heisenberg_all_pairs.py
+!tests/test_superexchange_backends.py
 !tests/test_framework_selection.py
 !tests/test_precision.py
 !tests/test_cudaq_execution.py

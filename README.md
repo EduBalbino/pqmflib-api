@@ -12,14 +12,17 @@ feature-map Hamiltonian that combines ideas from CD-Ising encodings and
 Heisenberg-style multi-axis interactions, as introduced in [4]. The library
 also includes `CDIsingProjectiveQFM` and `HeisenbergProjectiveQFM` as
 comparison maps.
+`SuperexchangeHeisenbergPQFM` extends Heisenberg with one site-position feature
+per qubit and spatially derived isotropic couplings.
 
 ## What The Library Does
 
 PQFMLib turns a numeric CSV dataset into quantum features through this workflow:
 
 1. Load a tabular dataset whose last column is the target.
-2. Estimate pairwise feature relations with a normalized mutual-information
-   matrix $J$.
+2. For CD-Ising and XYZ, estimate pairwise feature relations with a normalized
+   mutual-information matrix $J$. Heisenberg uses direct features or spatial
+   superexchange couplings without mutual information.
 3. Split features into one or more encoding blocks/layers and axis.
 4. Map features to qubits, optionally using QPU connectivity and edge quality.
 5. Build a parametrized Hamiltonian circuit.
@@ -84,7 +87,8 @@ available in `examples/`.
 
 ## Transformer API
 
-All three maps also support an in-memory transformer workflow for simulations:
+All three map families, including the superexchange facade, also support an
+in-memory transformer workflow for simulations:
 
 - `fit(X_train)` prepares the map using the training data and fixes its circuit
   structure for subsequent inputs.
@@ -147,8 +151,10 @@ Their values are used only to construct the parameter matrix for their own
 Heisenberg does not use mutual information. Its `fit()` freezes only the state
 that depends on the training feature dimension, including the number of
 blocks, parameter slots, interaction scale, layout, circuit, and observables.
-Each `transform(X)` applies the existing scaling and padding to the values in
-that specific `X`.
+In its default direct mode, each `transform(X)` applies the existing scaling
+and padding to the values in that specific `X`. Superexchange uses exactly one
+feature per qubit and derives couplings separately for each row, without tanh,
+padding, extra blocks, or fitted statistics.
 
 The legacy file-based workflow is unchanged:
 
@@ -683,6 +689,9 @@ original chain with one feature shared across `XX`, `YY`, and `ZZ` per edge.
 | `encoding_mode` | `"shared_feature"` | One feature per edge, or `"multi_axis"` for one feature per selected axis per edge |
 | `measure_2local_diagonal` | `False` | Add separate `ZZ`, `XX`, `YY` observables on each active edge |
 | `measure_cross_observables` | `False` | Add separate `XY`, `YX`, `XZ`, `ZX`, `YZ`, `ZY` observables on each active edge |
+| `measure_all_pairs` | `False` | Add `ZZ`, `XX`, `YY` for every logical pair, independently of interaction topology; incompatible with cross observables |
+| `coupling_mode` | `"direct"` | Use features directly on edges, or `"superexchange"` to derive isotropic couplings from site features |
+| `J0`, `ell` | `1.0`, `1.0` | Positive finite coupling scale and localization length for superexchange |
 
 **Topology and feature assignment.** `chain` uses `q_enc - 1` edges and preserves
 the original even-edge/odd-edge schedule. `full` requires `ideal=True` and uses
@@ -694,6 +703,7 @@ subset automatically or supply `use_fixed_phys_nodes=True` and
 qubit indices. The selected nodes become the initial transpiler layout; routing
 may still change the final layout.
 
+The following feature-to-edge assignment describes the default `direct` mode.
 For `full` and `native`, edges are sorted by logical indices `(i, j)`, with `i < j`;
 bidirectional hardware connections count once. In `multi_axis`, columns fill
 slots by block, then edge, then the order of `interaction_axes`. With `E` edges
@@ -720,12 +730,24 @@ caller's responsibility.
 **Measurements are independent of encoding.** One-local `Z`, `X`, `Y` are always
 measured on every qubit, in that order per qubit. Optional two-local measurements
 follow sorted edges, with diagonal terms first and then the six cross terms in
-the order listed above. With `n` qubits and `E` edges, output width is
+the order listed above. With `measure_all_pairs=False`, `n` qubits and `E` edges, output width is
 `3*n + 3*E*measure_2local_diagonal + 6*E*measure_cross_observables`.
 `XY` and `YX` are separate columns. Selecting only `XX` for encoding does not
 remove any requested measurement axes. Cross measurements do not introduce
 cross interactions into the encoding Hamiltonian. The legacy `axes` argument
 does not select the encoding; use `interaction_axes`.
+
+With `measure_all_pairs=True`, local `Z`, `X`, `Y` are followed by `ZZ`, `XX`,
+`YY` for each pair `(i, j)` in lexicographic order with `i < j`, including pairs
+that have no interaction edge. Output width is `3*n + 3*n*(n-1)/2`: **975 for
+25 qubits** and **2,460 for 40 qubits**. `measure_2local_diagonal` is redundant
+in this mode; `measure_cross_observables=True` raises `ValueError`. This readout
+also works with direct, anisotropic, and multi-axis Heisenberg encoding without
+changing the circuit or Hamiltonian. Column labels remain `q1_z_0`, `q1_x_0`,
+`q1_y_0`, ..., `q2_zz_0_1`, `q2_xx_0_1`, `q2_yy_0_1`, ... . Observables are sent
+in one batched Estimator PUB, allowing grouping into three global X/Y/Z bases
+when supported by the executor. Local BackendEstimatorV2/Aer tests verify three
+basis circuits per sample; real Runtime scheduling remains service-managed.
 
 ```python
 import numpy as np
@@ -797,6 +819,120 @@ metadata remain accepted with a warning: the caller must provide the correct
 encoding configuration because parameter names alone cannot verify axis
 assignment, interaction scales, or the edge schedule. `full` remains an ideal
 simulation topology, including when loading QPY files.
+
+### Spatial superexchange Heisenberg PQFM
+
+`SuperexchangeHeisenbergPQFM` is a thin facade over the Heisenberg circuit and
+execution pipeline. Equivalently, select
+`HeisenbergProjectiveQFM(coupling_mode="superexchange", ...)`. The original
+Heisenberg defaults are unchanged.
+
+Each input row contains exactly `q_enc = N` finite real features, interpreted
+as effective one-dimensional site positions. For every interaction edge:
+
+```math
+d_{ij}(x) = |x_i-x_j|,\qquad
+J_{ij}(x) = J_0 \exp\!\left(-\frac{2d_{ij}(x)}{\ell}\right),\qquad
+H_G(x) = \sum_{(i,j)\in E(G)} J_{ij}(x)(X_iX_j+Y_iY_j+Z_iZ_j).
+```
+
+`J0 > 0` and `ell > 0` must be finite, and both default to 1. In the Pauli
+convention, `J0` absorbs the spin-to-Pauli factor: physically motivated hopping
+`t_ij = t0 * exp(-d_ij/ell)` gives `J0 = t0**2/U`. This is a physics-inspired
+encoding of features as positions; they are not real atomic distances.
+
+Normalize/select features in the external training pipeline. Inputs in `[0, 1]`
+are convenient, but any finite real positions are accepted. The module applies
+no scaler, SHAP, mutual information, or cross-sample statistics.
+`use_tanh_scaling` is ignored in this mode, including when explicitly True.
+`interaction_axes` must contain all three axes and `encoding_mode` must be
+`"shared_feature"`. Each `Jij` multiplies XX, YY and ZZ equally; there are no
+local fields or anisotropic couplings. Very small couplings can underflow to
+zero at float64 precision.
+
+All `N` features participate on a chain with `N-1` couplings. A full graph has
+`N*(N-1)/2` couplings derived from the same `N` positions. Every topology uses
+one block with one slot per edge, without padding or extra feature blocks.
+Chain scheduling remains even/odd; native/full scheduling follows sorted logical
+edges. Haar initialization is fixed by `seed`, with the same layout and circuit
+for all rows after fitting. With one block, the inherited angle is
+`alpha * Jij / 2` for each RZZ/RXX/RYY, so each repetition corresponds to a
+first-order edge-product step with `delta = alpha/4` in the Pauli convention.
+`R` repeats that step; it does not divide the angle. To refine Trotter steps at
+fixed total time `t`, use `alpha = 4*t/R`.
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.base import clone
+from pqfmlib import SuperexchangeHeisenbergPQFM
+
+X_train = pd.DataFrame([[0., .25, .75], [.1, .4, .8]], columns=["a", "b", "c"])
+X_test = pd.DataFrame([[.2, .3, .9]], columns=X_train.columns)
+qfm = SuperexchangeHeisenbergPQFM(
+    name_file="sites", q_enc=3, J0=1., ell=1., topology="chain",
+    measure_all_pairs=True, expectation_method="statevector",
+)
+qfm.fit(X_train, y=[0, 1])  # y is accepted and ignored
+Xq_train = qfm.transform(X_train)  # NumPy (2, 18), no CSV/NPY writes
+Xq_test = qfm.transform(X_test)   # NumPy (1, 18), same frozen map
+np.testing.assert_allclose(clone(qfm).fit_transform(X_train), Xq_train)
+```
+
+Column names and order must match the fitted DataFrame. Changing coupling
+parameters, topology, encoding, readout or execution configuration requires a
+new `fit`. `fit/transform` use simulation. For the legacy CSV workflow:
+
+```python
+# data/sites.csv must have three position columns, then the target column y.
+runner = SuperexchangeHeisenbergPQFM(
+    name_file="sites", q_enc=3, data_dir="./data", output_root="./results",
+    J0=1., ell=1., measure_all_pairs=True, expectation_method="statevector",
+)
+result = runner.run()
+print(result["Xq_all_raw"].shape, result["csv_path"], result["metadata_path"])
+```
+
+`run()` saves CSV/NPY features, QPY circuits, JSON metadata and physical layout
+when available. Metadata records `coupling_mode`, `J0`, `ell`, edge/slot order,
+effective scaling and ordered observables. Superexchange output folders include
+the coupling scale/length and optional `allpairs`. Fixed QPY reuse validates
+coupling configuration in addition to the inherited circuit checks. Changing
+only the readout can reuse the same circuit. Older metadata without a coupling
+mode denotes `direct`; QPYs without encoding metadata retain the legacy warning.
+
+| Backend | Configuration |
+|---|---|
+| Qiskit exact CPU statevector | `expectation_method="statevector"`, `mps=False` |
+| Qiskit sampled statevector/MPS | `expectation_method="shots"`, `mps=False/True`; Aer MPS requires double precision |
+| CUDA-Q ideal GPU statevector/MPS | `framework="cudaq"`, `expectation_method="exact"`, `mps=False/True`; supports single/double precision |
+| Qiskit native topology/fakebackend | `ideal=False`, `topology="native"`, `ibm_qpu="ibm_kingston"`; configured IBM access supplies the real topology |
+| Real IBM QPU | `ideal=False`, `simulation=False`, `framework="qiskit"`, `expectation_method="shots"`, then explicit `run()` |
+
+`topology="full"` remains restricted to ideal simulation. CUDA-Q requires an
+accessible NVIDIA GPU and ideal simulation. CUDA-Q `exact` removes shot noise
+but does not remove MPS truncation. `shots`, `precision`, MPS limits, seeds,
+resource estimation and fixed layouts keep their inherited semantics. No real
+QPU jobs are submitted by the automated tests or the runnable example.
+
+The [superexchange example](examples/superexchange.py) follows the other basic
+examples: configure the constructor and call `run()`. It reads
+`data/Toxicity_original_MI_top20_standardized_0_1.csv` (20 feature columns plus
+the target), uses a 20-qubit full graph with CUDA-Q exact expectations and all-pairs readout,
+and saves artifacts under `./results`. Run it from a directory containing
+`data/`, or edit `data_dir`. To select another dataset, set `name_file` and
+`q_enc` to match its feature count. Edit the constructor arguments to change
+topology, backend or measurements. With `framework="cudaq"`, use
+`expectation_method="exact"` for analytical expectations, or keep `"shots"`
+for sampling. The in-memory transformer examples are shown above.
+
+```bash
+python examples/superexchange.py
+python -m unittest discover -s tests -p 'test_superexchange*.py' -v
+python -m unittest discover -s tests -p 'test_heisenberg_all_pairs.py' -v
+# Requires an accessible GPU; missing GPU/dependencies then cause a test failure.
+PQFMLIB_TEST_CUDAQ_GPU=1 python -m unittest discover -s tests -p 'test_superexchange_backends.py' -v
+```
 
 ### XYZ PQFM
 
@@ -1034,12 +1170,61 @@ simulation=False
 ibm_qpu="ibm_kingston"
 ```
 
-Generated `job_meta.json` files can be retrieved with the scripts in
-`scripts/`:
+### Retrieving completed QPU jobs
 
-- `get_job_xyz.py`
-- `get_job_cd_ising.py`
-- `get_job_heisenberg.py`
+Real QPU execution saves the submitted job ID and observable metadata in
+`job_meta.json` inside the execution output folder. To download the results,
+use the script for the corresponding map family:
+
+| Map | Retrieval script |
+| --- | --- |
+| XYZ | [`scripts/get_job_xyz.py`](scripts/get_job_xyz.py) |
+| CD-Ising | [`scripts/get_job_cd_ising.py`](scripts/get_job_cd_ising.py) |
+| Heisenberg, including superexchange and multi-axis encoding | [`scripts/get_job_heisenberg.py`](scripts/get_job_heisenberg.py) |
+
+**Use `get_job_heisenberg.py` for all Heisenberg variants:** the original
+`HeisenbergProjectiveQFM`, `SuperexchangeHeisenbergPQFM` (or
+`coupling_mode="superexchange"`), `encoding_mode="multi_axis"`, and selected
+interaction axes such as `interaction_axes=("x", "y")` for XX/YY interactions.
+The same script handles local, diagonal two-qubit, cross-axis, and all-pairs
+observables recorded in the job metadata.
+
+The script reads `job_meta.json`, retrieves the job with `service.job(job_id)`,
+and checks that it has completed. It then reads `job.result()[0].data.evs` and
+transposes the values into a samples-by-features matrix. Column names come
+from `obs_metadata`, so retrieval does not need to rebuild the circuit or
+reconstruct its encoding. Keep the original `job_meta.json` with the output
+folder; the legacy fallback without observable metadata only infers names
+for single-qubit features.
+
+Before running the Heisenberg retrieval script, edit its configuration:
+
+```python
+BASE_FOLDER = "path/to/execution_output"  # Contains job_meta.json
+NAME_FILE = "dataset_name"              # Without the .csv extension
+DATA_DIR = "./data"
+```
+
+With the IBM token configured as above, run from the repository root after
+installing the package:
+
+```bash
+python scripts/get_job_heisenberg.py
+```
+
+`DATA_DIR/NAME_FILE.csv` must contain the labels in its last column, with
+samples in exactly the same order as the submitted data. The script checks
+the sample count, but cannot detect reordered labels. It saves
+`qfeatures_all_<NAME_FILE>_heisenberg.csv` (features plus `y`) and
+`qfeatures_all_<NAME_FILE>_heisenberg.npy` (features only) in `BASE_FOLDER`.
+If the job is still running, rerun the script after it completes.
+
+Interaction axes and measured observables are independent: selecting XX/YY
+interactions does not automatically restrict the measured observables.
+Superexchange currently requires isotropic XYZ interactions and
+`encoding_mode="shared_feature"`; combining superexchange with XX/YY-only
+interactions or `multi_axis` encoding is rejected during validation. These
+submission constraints do not change which retrieval script to use.
 
 ## References
 

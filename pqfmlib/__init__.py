@@ -10,7 +10,7 @@ except ModuleNotFoundError:  # Python 3.10 compatibility.
 
 from pqfmlib.maps.xyz import XYZProjectiveQFM
 from pqfmlib.maps.cd_ising import CDIsingProjectiveQFM
-from pqfmlib.maps.heisenberg import HeisenbergProjectiveQFM
+from pqfmlib.maps.heisenberg import HeisenbergProjectiveQFM, SuperexchangeHeisenbergPQFM
 
 
 def _package_version() -> str:
@@ -35,4 +35,5 @@ __all__ = [
     "XYZProjectiveQFM",
     "CDIsingProjectiveQFM",
     "HeisenbergProjectiveQFM",
+    "SuperexchangeHeisenbergPQFM",
 ]

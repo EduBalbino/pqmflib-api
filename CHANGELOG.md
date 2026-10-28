@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Added `SuperexchangeHeisenbergPQFM` and Heisenberg's optional
+  `coupling_mode="superexchange"`, deriving isotropic couplings from one finite
+  site-position feature per qubit with configurable positive `J0` and `ell`.
+  Direct Heisenberg encoding remains the default.
+- Added topology-independent `measure_all_pairs=True` readout for local Z/X/Y
+  and all-pairs ZZ/XX/YY, with stable labels and metadata. Existing circuits,
+  executors, R/alpha conventions and CSV/QPY contracts are reused.
+- Added coupling/physics/API regression tests, Aer statevector/MPS and local
+  fakebackend comparisons, opt-in CUDA-Q GPU checks, and a simple
+  CSV runner example. See the README for validation commands and
+  environment requirements.
+
 ## 0.5.0
 
 - Added configurable Heisenberg interaction topology: `chain` preserves the

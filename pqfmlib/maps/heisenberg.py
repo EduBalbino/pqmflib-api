@@ -38,6 +38,7 @@ def heisenberg_chain_observables(
     *,
     measure_2local_diagonal: bool = False,
     measure_cross_observables: bool = False,
+    measure_all_pairs: bool = False,
     edges_act: list[tuple[int, int]] | None = None,
 ):
     """Build Heisenberg observables.
@@ -51,8 +52,14 @@ def heisenberg_chain_observables(
 
     By default, two-local observables are measured on nearest-neighbor
     chain edges only.
+
+    ``measure_all_pairs`` adds ZZ, XX, YY for every pair i < j, independent
+    of interaction topology and measure_2local_diagonal. It cannot be combined
+    with cross observables, so its output has exactly 3*N + 3*N*(N-1)/2 terms.
     """
     num_qubits = int(num_qubits)
+    if measure_all_pairs and measure_cross_observables:
+        raise ValueError("measure_all_pairs cannot be combined with measure_cross_observables.")
 
     obs = []
     metadata = []
@@ -68,13 +75,15 @@ def heisenberg_chain_observables(
             metadata.append((axis, i))
 
     # Two-local diagonal observables: ZZ, XX, YY.
-    if measure_2local_diagonal or measure_cross_observables:
-        if edges_act is None:
+    if measure_all_pairs or measure_2local_diagonal or measure_cross_observables:
+        if measure_all_pairs:
+            edges_act = [(i, j) for i in range(num_qubits) for j in range(i + 1, num_qubits)]
+        elif edges_act is None:
             edges_act = [(i, i + 1) for i in range(num_qubits - 1)]
 
         edges = sorted({(min(i, j), max(i, j)) for i, j in edges_act})
 
-        axis_pairs = ["zz", "xx", "yy"] if measure_2local_diagonal else []
+        axis_pairs = ["zz", "xx", "yy"] if measure_2local_diagonal or measure_all_pairs else []
         if measure_cross_observables:
             axis_pairs += ["xy", "yx", "xz", "zx", "yz", "zy"]
         for i, j in edges:
@@ -116,6 +125,46 @@ def _validate_interaction_encoding(interaction_axes, encoding_mode):
     if encoding_mode not in ("shared_feature", "multi_axis"):
         raise ValueError("encoding_mode must be 'shared_feature' or 'multi_axis'.")
     return axes
+
+
+def make_superexchange_theta_matrix(
+    X: np.ndarray,
+    num_qubits: int,
+    *,
+    edges_act: list[tuple[int, int]] | None = None,
+    J0: float = 1.0,
+    ell: float = 1.0,
+):
+    """Map site positions to isotropic couplings in circuit schedule order.
+
+    Exactly one feature is required per qubit. No dataset statistics, scaling,
+    padding or extra blocks are used. Very distant sites can yield numerical
+    zero through floating-point underflow of the exponential.
+    """
+    for name, value in (("J0", J0), ("ell", ell)):
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be finite and positive.")
+    values, _ = BaseProjectiveQFM._coerce_feature_matrix(X)
+    if values.shape[1] != num_qubits:
+        raise ValueError("Superexchange requires exactly q_enc features (one per qubit).")
+    if num_qubits < 2:
+        raise ValueError("Superexchange requires at least two qubits.")
+    edges = _heisenberg_edge_schedule(num_qubits, edges_act)
+    left, right = np.asarray(edges, dtype=int).T
+    # Extended intermediates preserve finite distances divided by a large ell
+    # and avoid underflow before multiplication by a large J0. Public parameter
+    # matrices remain float64, like direct encoding.
+    with np.errstate(over="ignore", under="ignore"):
+        positions = values.astype(np.longdouble)
+        distances = np.abs(positions[:, left] - positions[:, right])
+        theta = (np.longdouble(J0) * np.exp(-2 * distances / np.longdouble(ell))).astype(np.float64)
+    return theta, {
+        "num_features": int(num_qubits),
+        "features_per_block": len(edges),
+        "num_blocks": 1,
+        "total_slots": len(edges),
+        "use_tanh_scaling": False,
+    }
 
 
 def make_heisenberg_theta_matrix(
@@ -281,9 +330,18 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
     encoding_mode:
         "shared_feature" uses one feature per edge across the selected axes;
         "multi_axis" uses one feature per selected axis per edge.
+    coupling_mode:
+        "direct" preserves feature-to-edge encoding. "superexchange" requires
+        exactly q_enc site features and isotropic shared interactions, using
+        J0 * exp(-2 * abs(x_i - x_j) / ell) without tanh scaling. J0 and ell
+        must be finite and positive. One block covers all interaction edges.
     measure_cross_observables:
         Add separate XY, YX, XZ, ZX, YZ, ZY measurements on each active edge.
         Independent of measure_2local_diagonal; does not change encoding.
+    measure_all_pairs:
+        Measure local Z/X/Y followed by ZZ/XX/YY for every pair i < j,
+        independently of interaction topology. Cannot be combined with
+        measure_cross_observables. Does not change the circuit or Hamiltonian.
     R:
         Number of repetitions of the even/odd Heisenberg chain schedule.
     alpha:
@@ -307,6 +365,10 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
     interaction_axes: tuple[str, ...] = field(default=("x", "y", "z"), kw_only=True)
     encoding_mode: str = field(default="shared_feature", kw_only=True)
     measure_cross_observables: bool = field(default=False, kw_only=True)
+    measure_all_pairs: bool = field(default=False, kw_only=True)
+    coupling_mode: str = field(default="direct", kw_only=True)
+    J0: float = field(default=1.0, kw_only=True)
+    ell: float = field(default=1.0, kw_only=True)
 
     R: int = 2
     alpha: float = 0.1
@@ -349,7 +411,36 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
             raise ValueError("topology='native' requires ideal=False and a target QPU.")
 
     def _validate_encoding(self):
+        if self.measure_all_pairs and self.measure_cross_observables:
+            raise ValueError("measure_all_pairs cannot be combined with measure_cross_observables.")
         self.interaction_axes = _validate_interaction_encoding(self.interaction_axes, self.encoding_mode)
+        if self.coupling_mode not in ("direct", "superexchange"):
+            raise ValueError("coupling_mode must be 'direct' or 'superexchange'.")
+        if self.coupling_mode == "superexchange":
+            if set(self.interaction_axes) != {"x", "y", "z"} or self.encoding_mode != "shared_feature":
+                raise ValueError("Superexchange requires isotropic x/y/z interactions and shared_feature encoding.")
+            for name in ("J0", "ell"):
+                value = getattr(self, name)
+                if not np.isfinite(value) or value <= 0:
+                    raise ValueError(f"{name} must be finite and positive.")
+
+    def _make_theta_matrix(self, X):
+        """Use the selected coupling strategy for both transformer and runner."""
+        if self.coupling_mode == "superexchange":
+            return make_superexchange_theta_matrix(
+                X, self.q_enc, edges_act=self._encoding_edges(), J0=self.J0, ell=self.ell,
+            )
+        return make_heisenberg_theta_matrix(
+            X, self.q_enc, edges_act=self._encoding_edges(),
+            interaction_axes=self.interaction_axes, encoding_mode=self.encoding_mode,
+            use_tanh_scaling=self.use_tanh_scaling,
+        )
+
+    def _coupling_metadata(self):
+        metadata = {"coupling_mode": self.coupling_mode}
+        if self.coupling_mode == "superexchange":
+            metadata.update(J0=float(self.J0), ell=float(self.ell))
+        return metadata
 
     def _encoding_edges(self):
         # None retains the exact legacy chain parameter ordering.
@@ -364,7 +455,11 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
             self.topology,
             tuple(self.interaction_axes),
             self.encoding_mode,
+            self.coupling_mode,
+            float(self.J0),
+            float(self.ell),
             bool(self.measure_cross_observables),
+            bool(self.measure_all_pairs),
             int(self.seed),
             bool(self.simulation),
             bool(self.fakebackend),
@@ -419,11 +514,14 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
             interaction_axes=self.interaction_axes,
             encoding_mode=self.encoding_mode,
         )
-        qc_param.metadata["pqfmlib_heisenberg"]["use_tanh_scaling"] = bool(self.use_tanh_scaling)
+        qc_param.metadata["pqfmlib_heisenberg"].update(
+            self._coupling_metadata(), use_tanh_scaling=self.theta_info["use_tanh_scaling"],
+        )
         obs_list, obs_metadata = heisenberg_chain_observables(
             self.q_enc,
             measure_2local_diagonal=self.measure_2local_diagonal,
             measure_cross_observables=self.measure_cross_observables,
+            measure_all_pairs=self.measure_all_pairs,
             edges_act=self.edges_act,
         )
         return qc_param, param_order, obs_list, obs_metadata
@@ -458,19 +556,15 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
         self._validate_topology()
         self._validate_encoding()
         self._prepare_fit_input(X)
+        if self.coupling_mode == "superexchange" and self.n_features_in_ != self.q_enc:
+            raise ValueError("Superexchange requires exactly q_enc features (one per qubit).")
         self._reset_fitted_map_state()
         self.base_folder = None
         self.num_features = self.n_features_in_
         self.setup_backend_and_estimator()
         self.prepare_layout()
-        _unused_theta, self.theta_info = make_heisenberg_theta_matrix(
-            np.zeros((1, self.n_features_in_), dtype=float),
-            self.q_enc,
-            edges_act=self._encoding_edges(),
-            interaction_axes=self.interaction_axes,
-            encoding_mode=self.encoding_mode,
-            use_tanh_scaling=self.use_tanh_scaling,
-        )
+        _unused_theta, self.theta_info = self._make_theta_matrix(
+            np.zeros((1, self.n_features_in_), dtype=float))
         self._prepare_fitted_execution()
         self._mark_fitted(self._transform_config_signature())
         return self
@@ -478,15 +572,7 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
     def transform(self, X) -> np.ndarray:
         """Apply the fitted Heisenberg map without changing its structure."""
         X_transform = self._prepare_transform_input(X, self._transform_config_signature())
-        theta_values_all, theta_info = make_heisenberg_theta_matrix(
-            X_transform,
-            self.q_enc,
-            features_per_block=self.theta_info["features_per_block"],
-            edges_act=self._encoding_edges(),
-            interaction_axes=self.interaction_axes,
-            encoding_mode=self.encoding_mode,
-            use_tanh_scaling=self.use_tanh_scaling,
-        )
+        theta_values_all, theta_info = self._make_theta_matrix(X_transform)
         structural_keys = (
             "num_features",
             "features_per_block",
@@ -539,6 +625,10 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
             parts.append("diagobs")
         if self.measure_cross_observables:
             parts.append("crossobs")
+        if self.measure_all_pairs:
+            parts.append("allpairs")
+        if self.coupling_mode == "superexchange":
+            parts.extend(["superexchange", f"J0{self.J0}", f"ell{self.ell}"])
         self.ensure_output_folder("_".join(parts))
 
     def prepare_layout(self) -> None:
@@ -624,7 +714,8 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
             if not isinstance(stored, dict) or stored.get("schema_version") != 1:
                 raise ValueError("Unsupported Heisenberg circuit metadata schema.")
             mismatches = [key for key, value in expected.items()
-                          if (key != "use_tanh_scaling" or key in stored) and stored.get(key) != value]
+                          if (key != "use_tanh_scaling" or key in stored)
+                          and stored.get(key, "direct" if key == "coupling_mode" else None) != value]
             if mismatches:
                 raise ValueError("Fixed circuit encoding configuration differs: " + ", ".join(mismatches))
         nodes = self._fixed_initial_nodes(circuit)
@@ -698,14 +789,7 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
         return qc_t
 
     def execute_quantum_feature_map(self):
-        theta_values_all, self.theta_info = make_heisenberg_theta_matrix(
-            self.X_q_all,
-            self.q_enc,
-            edges_act=self._encoding_edges(),
-            interaction_axes=self.interaction_axes,
-            encoding_mode=self.encoding_mode,
-            use_tanh_scaling=self.use_tanh_scaling,
-        )
+        theta_values_all, self.theta_info = self._make_theta_matrix(self.X_q_all)
 
         qc_param, param_order, obs_list, obs_metadata = self._build_circuit_and_observables()
 
@@ -731,6 +815,7 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
         obs_isa_broadcast = [[obs] for obs in obs_isa]
 
         metadata_extra = {
+            **self._coupling_metadata(),
             "q_enc": int(self.q_enc),
             "topology": self.topology,
             "interaction_axes": list(self.interaction_axes),
@@ -738,6 +823,7 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
             "edges_act": [list(edge) for edge in self.edges_act],
             "measure_2local_diagonal": bool(self.measure_2local_diagonal),
             "measure_cross_observables": bool(self.measure_cross_observables),
+            "measure_all_pairs": bool(self.measure_all_pairs),
             "num_features": int(self.theta_info["num_features"]),
             "parameter_names": [p.name for p in param_order],
             "circuit_parameter_names": [p.name for p in qc_t.parameters],
@@ -749,7 +835,7 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
             "features_per_block": int(self.theta_info["features_per_block"]),
             "num_blocks": int(self.theta_info["num_blocks"]),
             "total_slots": int(self.theta_info["total_slots"]),
-            "use_tanh_scaling": bool(self.use_tanh_scaling),
+            "use_tanh_scaling": self.theta_info["use_tanh_scaling"],
         }
         if self.phys_nodes is not None:
             metadata_extra["phys_nodes"] = [int(x) for x in self.phys_nodes]
@@ -800,6 +886,10 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
         self._validate_topology()
         self._validate_encoding()
         self.load_data()
+        if self.coupling_mode == "superexchange":
+            values, _ = self._coerce_feature_matrix(self.X_q_all)
+            if values.shape[1] != self.q_enc:
+                raise ValueError("Superexchange requires exactly q_enc features (one per qubit).")
         self.setup_backend_and_estimator()
         if self.topology == "chain":
             self.prepare_output_folder()
@@ -823,3 +913,18 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
             "theta_info": self.theta_info,
             "circuit_info": self.circuit_info,
         }
+
+
+@dataclass
+class SuperexchangeHeisenbergPQFM(HeisenbergProjectiveQFM):
+    """Heisenberg map with one position per qubit and spatial superexchange.
+
+    Uses ``J0 * exp(-2 * abs(x_i - x_j) / ell)`` in the inherited edge
+    schedule. Inputs must have exactly ``q_enc`` finite columns. Normalization
+    belongs to the caller; ``use_tanh_scaling`` is ignored in superexchange
+    mode. The inherited R/alpha convention is unchanged: each RPP angle is
+    ``alpha * Jij / 2`` (one block), i.e. delta = alpha/4 per repetition.
+    """
+
+    coupling_mode: str = field(default="superexchange", kw_only=True)
+    use_tanh_scaling: bool = False

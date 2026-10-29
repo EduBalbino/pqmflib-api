@@ -42,7 +42,7 @@ def apply_gate(size: int, width: int, batch: int, parity: bool = False):
 
 
 @tilelang.jit(target="cuda", execution_backend="tvm_ffi")
-def apply_cone_gate(size: int, batch: int, cones: int, gates: int):
+def apply_cone_gate(size: int, batch: int, cones: int, gates: int, parity: bool):
     @T.prim_func
     def kernel(state: T.Tensor((cones * batch, size, 2), "float64"),
                matrix: T.Tensor((gates, batch, 4, 4, 2), "float64"),
@@ -57,7 +57,8 @@ def apply_cone_gate(size: int, batch: int, cones: int, gates: int):
                 real = T.alloc_local((1,), "float64")
                 imag = T.alloc_local((1,), "float64")
                 real[0], imag[0] = 0.0, 0.0
-                for column in T.serial(4):
+                for k in T.serial(2 if parity else 4):
+                    column = row ^ (3 * k) if parity else k
                     source = (i & ~(1 << q0)) | ((column & 1) << q0)
                     source = (source & ~(1 << q1)) | (((column >> 1) & 1) << q1)
                     ar, ai = state[b, source, 0], state[b, source, 1]
@@ -113,10 +114,13 @@ def affine_rotation_plan(circuit, parameters):
     return plan
 
 
-def simulate_batch(circuit, parameters, values, plan=None):
+def simulate_batch(circuit, parameters, values, plan=None, instructions=None):
     bound = None if plan is not None else [circuit.assign_parameters(dict(zip(parameters, row))) for row in values]
     batch, size = len(values), 1 << circuit.num_qubits
-    instructions = circuit.data if bound is None else bound[0].data
+    if bound is not None:
+        instructions = bound[0].data
+    elif instructions is None:
+        instructions = circuit.data
     gates = []
     rotation_cache = {}
     i = 0
@@ -206,7 +210,7 @@ def simulate_batch(circuit, parameters, values, plan=None):
         return np.tile([1.0, 0.0, 0.0], (batch, circuit.num_qubits))
     if len(cones) * (1 << width) >= size:
         if batch > 8:
-            return np.concatenate([simulate_batch(circuit, parameters, values[i:i + 8], plan)
+            return np.concatenate([simulate_batch(circuit, parameters, values[i:i + 8], plan, instructions)
                                    for i in range(0, batch, 8)])
         matrices = {
             gate_width: torch.view_as_real(torch.tensor(
@@ -227,7 +231,7 @@ def simulate_batch(circuit, parameters, values, plan=None):
             state = output
         return local_expectations(state, circuit.num_qubits).cpu().numpy()
     if batch > 64 and width > 8:
-        return np.concatenate([simulate_batch(circuit, parameters, values[i:i + 64], plan)
+        return np.concatenate([simulate_batch(circuit, parameters, values[i:i + 64], plan, instructions)
                                for i in range(0, batch, 64)])
     prefix = gates[:circuit.num_qubits]
     product_initial = (len(prefix) == circuit.num_qubits
@@ -269,6 +273,8 @@ def simulate_batch(circuit, parameters, values, plan=None):
                     local_sites = (local_sites[0], 0 if local_sites[0] else 1)
             step_sites.append((*local_sites, gate_id))
         all_sites.append(step_sites)
+    parity = all(len(gates[index][0]) == 2 and gates[index][1]
+                 for _, selected, _ in cones for index in selected)
     matrices = torch.view_as_real(torch.tensor(np.stack(unique_matrices), device="cuda")).contiguous()
     sites = torch.tensor(all_sites, dtype=torch.int32, device="cuda")
     lanes, size = batch * len(cones), 1 << width
@@ -279,7 +285,7 @@ def simulate_batch(circuit, parameters, values, plan=None):
         state = torch.view_as_real(torch.tensor(initial_states, device="cuda")).repeat_interleave(batch, dim=0)
     for step in range(depth):
         output = torch.empty_like(state)
-        apply_cone_gate(size, batch, len(cones), len(unique_matrices))(state, matrices, sites[step], output)
+        apply_cone_gate(size, batch, len(cones), len(unique_matrices), parity)(state, matrices, sites[step], output)
         state = output
     targets = torch.tensor(observable_targets, device="cuda")[:, None]
     half = torch.arange(size // 2, device="cuda")[None, :]
@@ -310,6 +316,7 @@ class TileLangExecutor:
             raise RuntimeError("TileLang requires an available CUDA GPU")
         self.prepared = None
         self.angle_plan = None
+        self.instructions = None
 
     def execute(self, prepared, theta):
         if self.prepared is not prepared:
@@ -323,6 +330,8 @@ class TileLangExecutor:
                 raise ValueError("TileLang requires local Z/X/Y observables in site order")
             self.prepared = prepared
             self.angle_plan = affine_rotation_plan(prepared.qc_t, prepared.param_order)
-        values = [simulate_batch(prepared.qc_t, prepared.param_order, theta[i:i + 320], self.angle_plan)
+            self.instructions = tuple(prepared.qc_t.data)
+        values = [simulate_batch(prepared.qc_t, prepared.param_order, theta[i:i + 320],
+                                 self.angle_plan, self.instructions)
                   for i in range(0, len(theta), 320)]
         return np.concatenate(values), prepared.obs_metadata

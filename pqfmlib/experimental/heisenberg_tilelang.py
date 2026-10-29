@@ -95,7 +95,22 @@ def simulate_batch(circuit, parameters, values):
         sites = [bound[0].find_bit(q).index for q in instruction.qubits]
         if len(sites) not in (1, 2):
             raise ValueError(f"Unsupported gate: {gate.name}")
-        matrix = np.stack([np.asarray(c.data[i - 1].operation.to_matrix()) for c in bound])
+        rotations = instructions[i:i + 2]
+        if (gate.name == "rzz" and len(rotations) == 2
+                and [item.operation.name for item in rotations] == ["rxx", "ryy"]
+                and all(item.qubits == instruction.qubits for item in rotations)):
+            angles = np.array([[float(c.data[j].operation.params[0]) for j in (i - 1, i, i + 1)]
+                               for c in bound])
+            z, x, y = angles.T / 2
+            even, odd = np.exp(-1j * z), np.exp(1j * z)
+            matrix = np.zeros((batch, 4, 4), dtype=complex)
+            matrix[:, 0, 0] = matrix[:, 3, 3] = even * np.cos(x - y)
+            matrix[:, 0, 3] = matrix[:, 3, 0] = -1j * even * np.sin(x - y)
+            matrix[:, 1, 1] = matrix[:, 2, 2] = odd * np.cos(x + y)
+            matrix[:, 1, 2] = matrix[:, 2, 1] = -1j * odd * np.sin(x + y)
+            i += 2
+        else:
+            matrix = np.stack([np.asarray(c.data[i - 1].operation.to_matrix()) for c in bound])
         if len(sites) == 2:
             while i < len(instructions):
                 next_instruction = instructions[i]
@@ -121,6 +136,9 @@ def simulate_batch(circuit, parameters, values):
     if not gates:
         return np.tile([1.0, 0.0, 0.0], (batch, circuit.num_qubits))
     if len(cones) * (1 << width) >= size:
+        if batch > 8:
+            return np.concatenate([simulate_batch(circuit, parameters, values[i:i + 8])
+                                   for i in range(0, batch, 8)])
         matrices = {
             gate_width: torch.view_as_real(torch.tensor(
                 np.stack([matrix for sites, _, matrix in gates if len(sites) == gate_width]),
@@ -166,9 +184,19 @@ def simulate_batch(circuit, parameters, values):
         output = torch.empty_like(state)
         apply_cone_gate(size, lanes)(state, matrices[step], sites[step], output)
         state = output
-    features = [local_expectations(state[i * batch:(i + 1) * batch], width, target)
-                for i, (_, _, target) in enumerate(cones)]
-    return torch.cat(features, dim=1).cpu().numpy()
+    targets = torch.tensor([target for _, _, target in cones], device="cuda")[:, None]
+    half = torch.arange(size // 2, device="cuda")[None, :]
+    zeros = (half & ((1 << targets) - 1)) | ((half >> targets) << (targets + 1))
+    ones = zeros | (1 << targets)
+    states = state.reshape(len(cones), batch, size, 2)
+    shape = (len(cones), batch, size // 2, 2)
+    a = states.gather(2, zeros[:, None, :, None].expand(shape))
+    b = states.gather(2, ones[:, None, :, None].expand(shape))
+    ar, ai, br, bi = a[..., 0], a[..., 1], b[..., 0], b[..., 1]
+    features = torch.stack(((ar * ar + ai * ai - br * br - bi * bi).sum(dim=2),
+                            (2 * (ar * br + ai * bi)).sum(dim=2),
+                            (2 * (ar * bi - ai * br)).sum(dim=2)), dim=2)
+    return features.permute(1, 0, 2).reshape(batch, -1).cpu().numpy()
 
 
 class TileLangExecutor:
@@ -195,6 +223,6 @@ class TileLangExecutor:
                            for group, obs in zip(actual, expected))):
                 raise ValueError("TileLang requires local Z/X/Y observables in site order")
             self.prepared = prepared
-        values = [simulate_batch(prepared.qc_t, prepared.param_order, theta[i:i + 8])
-                  for i in range(0, len(theta), 8)]
+        values = [simulate_batch(prepared.qc_t, prepared.param_order, theta[i:i + 32])
+                  for i in range(0, len(theta), 32)]
         return np.concatenate(values), prepared.obs_metadata

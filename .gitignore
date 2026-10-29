@@ -46,6 +46,8 @@ Thumbs.db
 # Local datasets and notebooks
 data/
 *.ipynb
+!experiments/sia/QIMED_MoE_Demanda_Pressao_pqfmlib_api.ipynb
+experiments/*
 !examples/*.ipynb
 dataset_exploration.ipynb
 tutorial/

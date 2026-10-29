@@ -195,6 +195,26 @@ def simulate_batch(circuit, parameters, values, plan=None):
                 state, matrix, output, sites[0], sites[1] if gate_width == 2 else 0)
             state = output
         return local_expectations(state, circuit.num_qubits).cpu().numpy()
+    prefix = gates[:circuit.num_qubits]
+    product_initial = (len(prefix) == circuit.num_qubits
+                       and all(len(sites) == 1 and np.array_equal(matrix, np.broadcast_to(matrix[0], matrix.shape))
+                               for sites, _, matrix in prefix)
+                       and {sites[0] for sites, _, _ in prefix} == set(range(circuit.num_qubits))
+                       and all(item.operation.name == "unitary" for item in instructions[:circuit.num_qubits]))
+    if product_initial and any(any(index >= circuit.num_qubits for index in selected) for _, selected, _ in cones):
+        initial = {sites[0]: matrix[0, :, 0] for sites, _, matrix in prefix}
+        local = np.zeros((len(cones), width, 2), dtype=complex)
+        local[:, :, 0] = 1
+        for k, (positions, _, _) in enumerate(cones):
+            for site, position in positions.items():
+                local[k, position] = initial[site]
+        bits = (np.arange(1 << width)[:, None] >> np.arange(width)) & 1
+        amplitudes = np.take_along_axis(local[:, None, :, :], bits[None, :, :, None], axis=3)
+        initial_states = amplitudes[..., 0].prod(axis=2)
+        cones = [(positions, [index for index in selected if index >= circuit.num_qubits], target)
+                 for positions, selected, target in cones]
+    else:
+        initial_states = None
     depth = max(len(selected) for _, selected, _ in cones)
     identity = np.broadcast_to(np.eye(4, dtype=complex), (batch, 4, 4))
     all_matrices, all_sites = [], []
@@ -216,8 +236,11 @@ def simulate_batch(circuit, parameters, values, plan=None):
     matrices = torch.view_as_real(torch.tensor(np.stack(all_matrices), device="cuda")).contiguous()
     sites = torch.tensor(all_sites, dtype=torch.int32, device="cuda")
     lanes, size = batch * len(cones), 1 << width
-    state = torch.zeros((lanes, size, 2), dtype=torch.float64, device="cuda")
-    state[:, 0, 0] = 1.0
+    if initial_states is None:
+        state = torch.zeros((lanes, size, 2), dtype=torch.float64, device="cuda")
+        state[:, 0, 0] = 1.0
+    else:
+        state = torch.view_as_real(torch.tensor(initial_states, device="cuda")).repeat_interleave(batch, dim=0)
     for step in range(depth):
         output = torch.empty_like(state)
         apply_cone_gate(size, lanes)(state, matrices[step], sites[step], output)

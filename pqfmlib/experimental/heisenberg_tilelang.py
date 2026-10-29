@@ -117,6 +117,7 @@ def simulate_batch(circuit, parameters, values, plan=None):
     batch, size = len(values), 1 << circuit.num_qubits
     instructions = circuit.data if bound is None else bound[0].data
     gates = []
+    rotation_cache = {}
     i = 0
     while i < len(instructions):
         instruction = instructions[i]
@@ -131,20 +132,26 @@ def simulate_batch(circuit, parameters, values, plan=None):
         if (gate.name == "rzz" and len(rotations) == 2
                 and [item.operation.name for item in rotations] == ["rxx", "ryy"]
                 and all(item.qubits == instruction.qubits for item in rotations)):
-            if plan is None:
-                angles = np.array([[float(c.data[j].operation.params[0]) for j in (i - 1, i, i + 1)]
-                                   for c in bound])
+            key = tuple(plan[j] for j in (i - 1, i, i + 1)) if plan is not None else None
+            if key is not None and key in rotation_cache:
+                matrix = rotation_cache[key]
             else:
-                angles = np.stack([values[:, column] * scale + offset if column is not None
-                                   else np.full(batch, offset)
-                                   for column, scale, offset in (plan[j] for j in (i - 1, i, i + 1))], axis=1)
-            z, x, y = angles.T / 2
-            even, odd = np.exp(-1j * z), np.exp(1j * z)
-            matrix = np.zeros((batch, 4, 4), dtype=complex)
-            matrix[:, 0, 0] = matrix[:, 3, 3] = even * np.cos(x - y)
-            matrix[:, 0, 3] = matrix[:, 3, 0] = -1j * even * np.sin(x - y)
-            matrix[:, 1, 1] = matrix[:, 2, 2] = odd * np.cos(x + y)
-            matrix[:, 1, 2] = matrix[:, 2, 1] = -1j * odd * np.sin(x + y)
+                if plan is None:
+                    angles = np.array([[float(c.data[j].operation.params[0]) for j in (i - 1, i, i + 1)]
+                                       for c in bound])
+                else:
+                    angles = np.stack([values[:, column] * scale + offset if column is not None
+                                       else np.full(batch, offset)
+                                       for column, scale, offset in key], axis=1)
+                z, x, y = angles.T / 2
+                even, odd = np.exp(-1j * z), np.exp(1j * z)
+                matrix = np.zeros((batch, 4, 4), dtype=complex)
+                matrix[:, 0, 0] = matrix[:, 3, 3] = even * np.cos(x - y)
+                matrix[:, 0, 3] = matrix[:, 3, 0] = -1j * even * np.sin(x - y)
+                matrix[:, 1, 1] = matrix[:, 2, 2] = odd * np.cos(x + y)
+                matrix[:, 1, 2] = matrix[:, 2, 1] = -1j * odd * np.sin(x + y)
+                if key is not None:
+                    rotation_cache[key] = matrix
             i += 2
         else:
             matrix = (np.broadcast_to(np.asarray(gate.to_matrix()), (batch, 2, 2)) if plan is not None
@@ -286,6 +293,6 @@ class TileLangExecutor:
                 raise ValueError("TileLang requires local Z/X/Y observables in site order")
             self.prepared = prepared
             self.angle_plan = affine_rotation_plan(prepared.qc_t, prepared.param_order)
-        values = [simulate_batch(prepared.qc_t, prepared.param_order, theta[i:i + 32], self.angle_plan)
-                  for i in range(0, len(theta), 32)]
+        values = [simulate_batch(prepared.qc_t, prepared.param_order, theta[i:i + 64], self.angle_plan)
+                  for i in range(0, len(theta), 64)]
         return np.concatenate(values), prepared.obs_metadata

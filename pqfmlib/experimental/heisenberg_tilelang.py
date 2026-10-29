@@ -41,9 +41,36 @@ def apply_gate(size: int, width: int, batch: int, parity: bool = False):
     return kernel
 
 
-def local_expectations(state, qubits):
+@tilelang.jit(target="cuda", execution_backend="tvm_ffi")
+def apply_cone_gate(size: int, batch: int):
+    @T.prim_func
+    def kernel(state: T.Tensor((batch, size, 2), "float64"),
+               matrix: T.Tensor((batch, 4, 4, 2), "float64"),
+               sites: T.Tensor((batch, 2), "int32"),
+               output: T.Tensor((batch, size, 2), "float64")):
+        with T.Kernel(T.ceildiv(size, 128), batch, threads=128) as (block, b):
+            i = block * 128 + T.get_thread_binding()
+            if i < size:
+                q0, q1 = sites[b, 0], sites[b, 1]
+                row = ((i >> q0) & 1) + 2 * ((i >> q1) & 1)
+                real = T.alloc_local((1,), "float64")
+                imag = T.alloc_local((1,), "float64")
+                real[0], imag[0] = 0.0, 0.0
+                for column in T.serial(4):
+                    source = (i & ~(1 << q0)) | ((column & 1) << q0)
+                    source = (source & ~(1 << q1)) | (((column >> 1) & 1) << q1)
+                    ar, ai = state[b, source, 0], state[b, source, 1]
+                    mr, mi = matrix[b, row, column, 0], matrix[b, row, column, 1]
+                    real[0] += mr * ar - mi * ai
+                    imag[0] += mr * ai + mi * ar
+                output[b, i, 0] = real[0]
+                output[b, i, 1] = imag[0]
+    return kernel
+
+
+def local_expectations(state, qubits, target=None):
     values = []
-    for qubit in range(qubits):
+    for qubit in range(qubits) if target is None else (target,):
         pairs = state.reshape(len(state), -1, 2, 1 << qubit, 2)
         ar, ai = pairs[:, :, 0, :, 0], pairs[:, :, 0, :, 1]
         br, bi = pairs[:, :, 1, :, 0], pairs[:, :, 1, :, 1]
@@ -56,8 +83,6 @@ def local_expectations(state, qubits):
 def simulate_batch(circuit, parameters, values):
     bound = [circuit.assign_parameters(dict(zip(parameters, row))) for row in values]
     batch, size = len(bound), 1 << circuit.num_qubits
-    state = torch.zeros((batch, size, 2), dtype=torch.float64, device="cuda")
-    state[:, 0, 0] = 1.0
     instructions = bound[0].data
     gates = []
     i = 0
@@ -82,21 +107,68 @@ def simulate_batch(circuit, parameters, values):
         parity = len(sites) == 2 and not matrix[:, [0, 0, 1, 1, 2, 2, 3, 3], [1, 2, 0, 3, 0, 3, 1, 2]].any()
         gates.append((sites, parity, matrix))
 
-    matrices = {
-        width: torch.view_as_real(torch.tensor(
-            np.stack([matrix for sites, _, matrix in gates if len(sites) == width]),
-            dtype=torch.complex128, device="cuda")).contiguous()
-        for width in (1, 2) if any(len(sites) == width for sites, _, _ in gates)
-    }
-    indices = {1: 0, 2: 0}
-    for sites, parity, _ in gates:
-        width = len(sites)
-        matrix = matrices[width][indices[width]]
-        indices[width] += 1
+    cones = []
+    for target in range(circuit.num_qubits):
+        active, selected = {target}, []
+        for index in range(len(gates) - 1, -1, -1):
+            sites = gates[index][0]
+            if active.intersection(sites):
+                active.update(sites)
+                selected.append(index)
+        positions = {site: i for i, site in enumerate(sorted(active))}
+        cones.append((positions, list(reversed(selected)), positions[target]))
+    width = max(2, max(len(positions) for positions, _, _ in cones))
+    if not gates:
+        return np.tile([1.0, 0.0, 0.0], (batch, circuit.num_qubits))
+    if len(cones) * (1 << width) >= size:
+        matrices = {
+            gate_width: torch.view_as_real(torch.tensor(
+                np.stack([matrix for sites, _, matrix in gates if len(sites) == gate_width]),
+                dtype=torch.complex128, device="cuda")).contiguous()
+            for gate_width in (1, 2) if any(len(sites) == gate_width for sites, _, _ in gates)
+        }
+        indices = {1: 0, 2: 0}
+        state = torch.zeros((batch, size, 2), dtype=torch.float64, device="cuda")
+        state[:, 0, 0] = 1.0
+        for sites, parity, _ in gates:
+            gate_width = len(sites)
+            matrix = matrices[gate_width][indices[gate_width]]
+            indices[gate_width] += 1
+            output = torch.empty_like(state)
+            apply_gate(size, gate_width, batch, parity)(
+                state, matrix, output, sites[0], sites[1] if gate_width == 2 else 0)
+            state = output
+        return local_expectations(state, circuit.num_qubits).cpu().numpy()
+    depth = max(len(selected) for _, selected, _ in cones)
+    identity = np.broadcast_to(np.eye(4, dtype=complex), (batch, 4, 4))
+    all_matrices, all_sites = [], []
+    for step in range(depth):
+        step_matrices, step_sites = [], []
+        for positions, selected, _ in cones:
+            if step >= len(selected):
+                matrix, local_sites = identity, (0, 1)
+            else:
+                sites, _, matrix = gates[selected[step]]
+                local_sites = tuple(positions[site] for site in sites)
+                if len(sites) == 1:
+                    local_sites = (local_sites[0], 0 if local_sites[0] else 1)
+                    matrix = np.kron(np.eye(2), matrix)
+            step_matrices.append(matrix)
+            step_sites.extend([local_sites] * batch)
+        all_matrices.append(np.concatenate(step_matrices))
+        all_sites.append(step_sites)
+    matrices = torch.view_as_real(torch.tensor(np.stack(all_matrices), device="cuda")).contiguous()
+    sites = torch.tensor(all_sites, dtype=torch.int32, device="cuda")
+    lanes, size = batch * len(cones), 1 << width
+    state = torch.zeros((lanes, size, 2), dtype=torch.float64, device="cuda")
+    state[:, 0, 0] = 1.0
+    for step in range(depth):
         output = torch.empty_like(state)
-        apply_gate(size, width, batch, parity)(state, matrix, output, sites[0], sites[1] if width == 2 else 0)
+        apply_cone_gate(size, lanes)(state, matrices[step], sites[step], output)
         state = output
-    return local_expectations(state, circuit.num_qubits).cpu().numpy()
+    features = [local_expectations(state[i * batch:(i + 1) * batch], width, target)
+                for i, (_, _, target) in enumerate(cones)]
+    return torch.cat(features, dim=1).cpu().numpy()
 
 
 class TileLangExecutor:

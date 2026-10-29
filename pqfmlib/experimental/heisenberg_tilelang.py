@@ -11,7 +11,7 @@ import tilelang.language as T
 
 
 @tilelang.jit(target="cuda", execution_backend="tvm_ffi")
-def apply_gate(size: int, width: int):
+def apply_gate(size: int, width: int, parity: bool = False):
     dimension = 1 << width
 
     @T.prim_func
@@ -27,7 +27,8 @@ def apply_gate(size: int, width: int):
                 real = T.alloc_local((1,), "float64")
                 imag = T.alloc_local((1,), "float64")
                 real[0], imag[0] = 0.0, 0.0
-                for column in T.serial(dimension):
+                for k in T.serial(2 if parity else dimension):
+                    column = row ^ (3 * k) if parity else k
                     source = (i & ~(1 << q0)) | ((column & 1) << q0)
                     if width == 2:
                         source = (source & ~(1 << q1)) | (((column >> 1) & 1) << q1)
@@ -41,13 +42,11 @@ def apply_gate(size: int, width: int):
 
 
 def local_expectations(state, qubits):
-    indices = torch.arange(len(state), device=state.device)
     values = []
     for qubit in range(qubits):
-        zero = indices[(indices & (1 << qubit)) == 0]
-        one = zero | (1 << qubit)
-        ar, ai = state[zero, 0], state[zero, 1]
-        br, bi = state[one, 0], state[one, 1]
+        pairs = state.reshape(-1, 2, 1 << qubit, 2)
+        ar, ai = pairs[:, 0, :, 0], pairs[:, 0, :, 1]
+        br, bi = pairs[:, 1, :, 0], pairs[:, 1, :, 1]
         values.extend(((ar * ar + ai * ai - br * br - bi * bi).sum(),
                        (2 * (ar * br + ai * bi)).sum(),
                        (2 * (ar * bi - ai * br)).sum()))
@@ -59,17 +58,31 @@ def simulate_row(circuit, parameters, values):
     size = 1 << bound.num_qubits
     state = torch.zeros((size, 2), dtype=torch.float64, device="cuda")
     state[0, 0] = 1.0
-    for instruction in bound.data:
+    instructions = bound.data
+    i = 0
+    while i < len(instructions):
+        instruction = instructions[i]
+        i += 1
         gate = instruction.operation
         if gate.name == "barrier":
             continue
         sites = [bound.find_bit(q).index for q in instruction.qubits]
         if len(sites) not in (1, 2):
             raise ValueError(f"Unsupported gate: {gate.name}")
-        matrix = torch.tensor(np.asarray(gate.to_matrix()), dtype=torch.complex128, device="cuda")
+        matrix = np.asarray(gate.to_matrix())
+        if len(sites) == 2:
+            while i < len(instructions):
+                next_instruction = instructions[i]
+                if (next_instruction.qubits != instruction.qubits
+                        or next_instruction.operation.name == "barrier"):
+                    break
+                i += 1
+                matrix = np.asarray(next_instruction.operation.to_matrix()) @ matrix
+        parity = len(sites) == 2 and not matrix[np.array([0, 0, 1, 1, 2, 2, 3, 3]), np.array([1, 2, 0, 3, 0, 3, 1, 2])].any()
+        matrix = torch.tensor(matrix, dtype=torch.complex128, device="cuda")
         matrix = torch.view_as_real(matrix).contiguous()
         output = torch.empty_like(state)
-        apply_gate(size, len(sites))(state, matrix, output, sites[0], sites[1] if len(sites) == 2 else 0)
+        apply_gate(size, len(sites), parity)(state, matrix, output, sites[0], sites[1] if len(sites) == 2 else 0)
         state = output
     return local_expectations(state, bound.num_qubits).cpu().numpy()
 

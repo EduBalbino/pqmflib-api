@@ -42,16 +42,17 @@ def apply_gate(size: int, width: int, batch: int, parity: bool = False):
 
 
 @tilelang.jit(target="cuda", execution_backend="tvm_ffi")
-def apply_cone_gate(size: int, batch: int):
+def apply_cone_gate(size: int, batch: int, cones: int, gates: int):
     @T.prim_func
-    def kernel(state: T.Tensor((batch, size, 2), "float64"),
-               matrix: T.Tensor((batch, 4, 4, 2), "float64"),
-               sites: T.Tensor((batch, 2), "int32"),
-               output: T.Tensor((batch, size, 2), "float64")):
-        with T.Kernel(T.ceildiv(size, 128), batch, threads=128) as (block, b):
+    def kernel(state: T.Tensor((cones * batch, size, 2), "float64"),
+               matrix: T.Tensor((gates, batch, 4, 4, 2), "float64"),
+               sites: T.Tensor((cones, 3), "int32"),
+               output: T.Tensor((cones * batch, size, 2), "float64")):
+        with T.Kernel(T.ceildiv(size, 128), cones * batch, threads=128) as (block, b):
             i = block * 128 + T.get_thread_binding()
             if i < size:
-                q0, q1 = sites[b, 0], sites[b, 1]
+                cone, sample = b // batch, b % batch
+                q0, q1, gate = sites[cone, 0], sites[cone, 1], sites[cone, 2]
                 row = ((i >> q0) & 1) + 2 * ((i >> q1) & 1)
                 real = T.alloc_local((1,), "float64")
                 imag = T.alloc_local((1,), "float64")
@@ -60,7 +61,7 @@ def apply_cone_gate(size: int, batch: int):
                     source = (i & ~(1 << q0)) | ((column & 1) << q0)
                     source = (source & ~(1 << q1)) | (((column >> 1) & 1) << q1)
                     ar, ai = state[b, source, 0], state[b, source, 1]
-                    mr, mi = matrix[b, row, column, 0], matrix[b, row, column, 1]
+                    mr, mi = matrix[gate, sample, row, column, 0], matrix[gate, sample, row, column, 1]
                     real[0] += mr * ar - mi * ai
                     imag[0] += mr * ai + mi * ar
                 output[b, i, 0] = real[0]
@@ -250,23 +251,25 @@ def simulate_batch(circuit, parameters, values, plan=None):
         initial_states = None
     depth = max(len(selected) for _, selected, _ in cones)
     identity = np.broadcast_to(np.eye(4, dtype=complex), (batch, 4, 4))
-    all_matrices, all_sites = [], []
+    unique_matrices, matrix_ids, all_sites = [identity], {}, []
     for step in range(depth):
-        step_matrices, step_sites = [], []
+        step_sites = []
         for positions, selected, _ in cones:
             if step >= len(selected):
-                matrix, local_sites = identity, (0, 1)
+                local_sites, gate_id = (0, 1), 0
             else:
                 sites, _, matrix = gates[selected[step]]
                 local_sites = tuple(positions[site] for site in sites)
+                key = (id(matrix), len(sites))
+                if key not in matrix_ids:
+                    matrix_ids[key] = len(unique_matrices)
+                    unique_matrices.append(np.kron(np.eye(2), matrix) if len(sites) == 1 else matrix)
+                gate_id = matrix_ids[key]
                 if len(sites) == 1:
                     local_sites = (local_sites[0], 0 if local_sites[0] else 1)
-                    matrix = np.kron(np.eye(2), matrix)
-            step_matrices.append(matrix)
-            step_sites.extend([local_sites] * batch)
-        all_matrices.append(np.concatenate(step_matrices))
+            step_sites.append((*local_sites, gate_id))
         all_sites.append(step_sites)
-    matrices = torch.view_as_real(torch.tensor(np.stack(all_matrices), device="cuda")).contiguous()
+    matrices = torch.view_as_real(torch.tensor(np.stack(unique_matrices), device="cuda")).contiguous()
     sites = torch.tensor(all_sites, dtype=torch.int32, device="cuda")
     lanes, size = batch * len(cones), 1 << width
     if initial_states is None:
@@ -276,7 +279,7 @@ def simulate_batch(circuit, parameters, values, plan=None):
         state = torch.view_as_real(torch.tensor(initial_states, device="cuda")).repeat_interleave(batch, dim=0)
     for step in range(depth):
         output = torch.empty_like(state)
-        apply_cone_gate(size, lanes)(state, matrices[step], sites[step], output)
+        apply_cone_gate(size, batch, len(cones), len(unique_matrices))(state, matrices, sites[step], output)
         state = output
     targets = torch.tensor(observable_targets, device="cuda")[:, None]
     half = torch.arange(size // 2, device="cuda")[None, :]

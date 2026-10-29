@@ -233,6 +233,14 @@ def execute_prepared_projected_feature_job(
     theta_values_all = np.asarray(theta_values_all)
     if theta_values_all.ndim != 2:
         raise ValueError("theta_values_all must be a 2D matrix.")
+    if framework == "tilelang":
+        if not simulation or resource_estimation or expectation_method != "exact":
+            raise ValueError("TileLang requires exact simulation without resource estimation.")
+        from pqfmlib.experimental.heisenberg_tilelang import TileLangExecutor
+
+        if not isinstance(backend, TileLangExecutor):
+            raise ValueError("framework='tilelang' requires a TileLangExecutor backend.")
+        return backend.execute(prepared, theta_values_all)
     if framework == "cudaq":
         if not simulation or resource_estimation:
             raise ValueError("CUDA-Q execution requires simulation=True and resource_estimation=False.")

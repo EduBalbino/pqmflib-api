@@ -765,7 +765,7 @@ class HeisenbergProjectiveQFM(BaseProjectiveQFM):
             extracted = _extract_initial_phys_nodes(qc_t, source)
             if extracted is not None:
                 self.phys_nodes = extracted
-        elif self.fixed_circuit_file_name or self.framework == "cudaq":
+        elif self.fixed_circuit_file_name or self.framework in ("cudaq", "tilelang"):
             qc_t = source.copy()
         else:
             pm = generate_preset_pass_manager(

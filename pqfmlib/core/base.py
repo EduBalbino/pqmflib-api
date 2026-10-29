@@ -154,10 +154,11 @@ class BaseProjectiveQFM(TransformerMixin, BaseEstimator):
             ideal=self.ideal,
             fakebackend=self.fakebackend,
         )
-
     def _validate_expectation_method(self) -> None:
-        if self.framework == "cudaq" and self.expectation_method == "exact":
+        if self.framework in ("cudaq", "tilelang") and self.expectation_method == "exact":
             return
+        if self.framework == "tilelang":
+            raise ValueError("TileLang requires expectation_method='exact'.")
         if self.expectation_method not in ("shots", "statevector"):
             raise ValueError("expectation_method must be 'shots' or 'statevector'.")
         if self.expectation_method == "statevector":
@@ -191,6 +192,14 @@ class BaseProjectiveQFM(TransformerMixin, BaseEstimator):
         self._validate_precision()
         self._validate_expectation_method()
         self._validate_resource_estimation_mode()
+        if self.framework == "tilelang":
+            from pqfmlib.experimental.heisenberg_tilelang import TileLangExecutor
+
+            if self.precision != "double" or self.mps or self.statevector_device not in (None, "GPU"):
+                raise ValueError("TileLang requires double precision and GPU statevector execution.")
+            self.backend = TileLangExecutor()
+            self.estimator = None
+            return
         if self.framework == "cudaq":
             from pqfmlib.core.cudaq_execution import CudaqExecutor
 

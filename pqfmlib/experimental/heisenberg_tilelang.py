@@ -80,10 +80,42 @@ def local_expectations(state, qubits, target=None):
     return torch.stack(values, dim=1)
 
 
-def simulate_batch(circuit, parameters, values):
-    bound = [circuit.assign_parameters(dict(zip(parameters, row))) for row in values]
-    batch, size = len(bound), 1 << circuit.num_qubits
-    instructions = bound[0].data
+def affine_rotation_plan(circuit, parameters):
+    positions = {parameter: i for i, parameter in enumerate(parameters)}
+    plan = {}
+    instructions = circuit.data
+    i = 0
+    while i < len(instructions):
+        instruction = instructions[i]
+        gate = instruction.operation
+        if gate.name == "barrier" or (gate.name == "unitary" and len(instruction.qubits) == 1):
+            i += 1
+            continue
+        group = instructions[i:i + 3]
+        if (len(group) != 3 or [item.operation.name for item in group] != ["rzz", "rxx", "ryy"]
+                or any(item.qubits != instruction.qubits for item in group)):
+            return None
+        for j, item in enumerate(group, i):
+            angle = item.operation.params[0]
+            params = getattr(angle, "parameters", set())
+            if len(params) > 1:
+                return None
+            if params:
+                parameter = next(iter(params))
+                derivative = angle.gradient(parameter)
+                if getattr(derivative, "parameters", set()) or parameter not in positions:
+                    return None
+                plan[j] = (positions[parameter], float(derivative), float(angle.bind({parameter: 0})))
+            else:
+                plan[j] = (None, 0.0, float(angle))
+        i += 3
+    return plan
+
+
+def simulate_batch(circuit, parameters, values, plan=None):
+    bound = None if plan is not None else [circuit.assign_parameters(dict(zip(parameters, row))) for row in values]
+    batch, size = len(values), 1 << circuit.num_qubits
+    instructions = circuit.data if bound is None else bound[0].data
     gates = []
     i = 0
     while i < len(instructions):
@@ -92,15 +124,20 @@ def simulate_batch(circuit, parameters, values):
         gate = instruction.operation
         if gate.name == "barrier":
             continue
-        sites = [bound[0].find_bit(q).index for q in instruction.qubits]
+        sites = [circuit.find_bit(q).index for q in instruction.qubits]
         if len(sites) not in (1, 2):
             raise ValueError(f"Unsupported gate: {gate.name}")
         rotations = instructions[i:i + 2]
         if (gate.name == "rzz" and len(rotations) == 2
                 and [item.operation.name for item in rotations] == ["rxx", "ryy"]
                 and all(item.qubits == instruction.qubits for item in rotations)):
-            angles = np.array([[float(c.data[j].operation.params[0]) for j in (i - 1, i, i + 1)]
-                               for c in bound])
+            if plan is None:
+                angles = np.array([[float(c.data[j].operation.params[0]) for j in (i - 1, i, i + 1)]
+                                   for c in bound])
+            else:
+                angles = np.stack([values[:, column] * scale + offset if column is not None
+                                   else np.full(batch, offset)
+                                   for column, scale, offset in (plan[j] for j in (i - 1, i, i + 1))], axis=1)
             z, x, y = angles.T / 2
             even, odd = np.exp(-1j * z), np.exp(1j * z)
             matrix = np.zeros((batch, 4, 4), dtype=complex)
@@ -110,8 +147,9 @@ def simulate_batch(circuit, parameters, values):
             matrix[:, 1, 2] = matrix[:, 2, 1] = -1j * odd * np.sin(x + y)
             i += 2
         else:
-            matrix = np.stack([np.asarray(c.data[i - 1].operation.to_matrix()) for c in bound])
-        if len(sites) == 2:
+            matrix = (np.broadcast_to(np.asarray(gate.to_matrix()), (batch, 2, 2)) if plan is not None
+                      else np.stack([np.asarray(c.data[i - 1].operation.to_matrix()) for c in bound]))
+        if len(sites) == 2 and plan is None:
             while i < len(instructions):
                 next_instruction = instructions[i]
                 if (next_instruction.qubits != instruction.qubits
@@ -137,7 +175,7 @@ def simulate_batch(circuit, parameters, values):
         return np.tile([1.0, 0.0, 0.0], (batch, circuit.num_qubits))
     if len(cones) * (1 << width) >= size:
         if batch > 8:
-            return np.concatenate([simulate_batch(circuit, parameters, values[i:i + 8])
+            return np.concatenate([simulate_batch(circuit, parameters, values[i:i + 8], plan)
                                    for i in range(0, batch, 8)])
         matrices = {
             gate_width: torch.view_as_real(torch.tensor(
@@ -211,6 +249,7 @@ class TileLangExecutor:
         if not torch.cuda.is_available():
             raise RuntimeError("TileLang requires an available CUDA GPU")
         self.prepared = None
+        self.angle_plan = None
 
     def execute(self, prepared, theta):
         if self.prepared is not prepared:
@@ -223,6 +262,7 @@ class TileLangExecutor:
                            for group, obs in zip(actual, expected))):
                 raise ValueError("TileLang requires local Z/X/Y observables in site order")
             self.prepared = prepared
-        values = [simulate_batch(prepared.qc_t, prepared.param_order, theta[i:i + 32])
+            self.angle_plan = affine_rotation_plan(prepared.qc_t, prepared.param_order)
+        values = [simulate_batch(prepared.qc_t, prepared.param_order, theta[i:i + 32], self.angle_plan)
                   for i in range(0, len(theta), 32)]
         return np.concatenate(values), prepared.obs_metadata

@@ -167,7 +167,7 @@ def simulate_batch(circuit, parameters, values, plan=None):
         parity = len(sites) == 2 and not matrix[:, [0, 0, 1, 1, 2, 2, 3, 3], [1, 2, 0, 3, 0, 3, 1, 2]].any()
         gates.append((sites, parity, matrix))
 
-    cones = []
+    cones, cone_lookup, observable_cones, observable_targets = [], {}, [], []
     for target in range(circuit.num_qubits):
         active, selected = {target}, []
         for index in range(len(gates) - 1, -1, -1):
@@ -176,7 +176,13 @@ def simulate_batch(circuit, parameters, values, plan=None):
                 active.update(sites)
                 selected.append(index)
         positions = {site: i for i, site in enumerate(sorted(active))}
-        cones.append((positions, list(reversed(selected)), positions[target]))
+        selected.reverse()
+        key = (tuple(positions), tuple(selected))
+        if key not in cone_lookup:
+            cone_lookup[key] = len(cones)
+            cones.append((positions, selected, positions[target]))
+        observable_cones.append(cone_lookup[key])
+        observable_targets.append(positions[target])
     width = max(2, max(len(positions) for positions, _, _ in cones))
     if not gates:
         return np.tile([1.0, 0.0, 0.0], (batch, circuit.num_qubits))
@@ -202,6 +208,9 @@ def simulate_batch(circuit, parameters, values, plan=None):
                 state, matrix, output, sites[0], sites[1] if gate_width == 2 else 0)
             state = output
         return local_expectations(state, circuit.num_qubits).cpu().numpy()
+    if batch > 64 and width > 8:
+        return np.concatenate([simulate_batch(circuit, parameters, values[i:i + 64], plan)
+                               for i in range(0, batch, 64)])
     prefix = gates[:circuit.num_qubits]
     product_initial = (len(prefix) == circuit.num_qubits
                        and all(len(sites) == 1 and np.array_equal(matrix, np.broadcast_to(matrix[0], matrix.shape))
@@ -252,12 +261,13 @@ def simulate_batch(circuit, parameters, values, plan=None):
         output = torch.empty_like(state)
         apply_cone_gate(size, lanes)(state, matrices[step], sites[step], output)
         state = output
-    targets = torch.tensor([target for _, _, target in cones], device="cuda")[:, None]
+    targets = torch.tensor(observable_targets, device="cuda")[:, None]
     half = torch.arange(size // 2, device="cuda")[None, :]
     zeros = (half & ((1 << targets) - 1)) | ((half >> targets) << (targets + 1))
     ones = zeros | (1 << targets)
     states = state.reshape(len(cones), batch, size, 2)
-    shape = (len(cones), batch, size // 2, 2)
+    states = states.index_select(0, torch.tensor(observable_cones, device="cuda"))
+    shape = (len(observable_cones), batch, size // 2, 2)
     a = states.gather(2, zeros[:, None, :, None].expand(shape))
     b = states.gather(2, ones[:, None, :, None].expand(shape))
     ar, ai, br, bi = a[..., 0], a[..., 1], b[..., 0], b[..., 1]
@@ -293,6 +303,6 @@ class TileLangExecutor:
                 raise ValueError("TileLang requires local Z/X/Y observables in site order")
             self.prepared = prepared
             self.angle_plan = affine_rotation_plan(prepared.qc_t, prepared.param_order)
-        values = [simulate_batch(prepared.qc_t, prepared.param_order, theta[i:i + 64], self.angle_plan)
-                  for i in range(0, len(theta), 64)]
+        values = [simulate_batch(prepared.qc_t, prepared.param_order, theta[i:i + 160], self.angle_plan)
+                  for i in range(0, len(theta), 160)]
         return np.concatenate(values), prepared.obs_metadata

@@ -183,6 +183,23 @@ def simulate_batch(circuit, parameters, values, plan=None):
             cones.append((positions, selected, positions[target]))
         observable_cones.append(cone_lookup[key])
         observable_targets.append(positions[target])
+    maximal = [i for i, (positions, _, _) in enumerate(cones)
+               if not any(i != j and set(positions) <= set(other_positions)
+                          and (len(positions) < len(other_positions) or j < i)
+                          for j, (other_positions, _, _) in enumerate(cones))]
+    if len(maximal) < len(cones):
+        old_cones = cones
+        cones = [old_cones[i] for i in maximal]
+        mapping = [next(j for j, (large_positions, _, _) in enumerate(cones)
+                        if set(positions) <= set(large_positions))
+                   for positions, _, _ in old_cones]
+        merged = [set(selected) for _, selected, _ in cones]
+        for index, (_, selected, _) in zip(mapping, old_cones):
+            merged[index].update(selected)
+        cones = [(positions, sorted(merged[i]), target)
+                 for i, (positions, _, target) in enumerate(cones)]
+        observable_cones = [mapping[index] for index in observable_cones]
+        observable_targets = [cones[index][0][target] for target, index in enumerate(observable_cones)]
     width = max(2, max(len(positions) for positions, _, _ in cones))
     if not gates:
         return np.tile([1.0, 0.0, 0.0], (batch, circuit.num_qubits))
@@ -303,6 +320,6 @@ class TileLangExecutor:
                 raise ValueError("TileLang requires local Z/X/Y observables in site order")
             self.prepared = prepared
             self.angle_plan = affine_rotation_plan(prepared.qc_t, prepared.param_order)
-        values = [simulate_batch(prepared.qc_t, prepared.param_order, theta[i:i + 160], self.angle_plan)
-                  for i in range(0, len(theta), 160)]
+        values = [simulate_batch(prepared.qc_t, prepared.param_order, theta[i:i + 320], self.angle_plan)
+                  for i in range(0, len(theta), 320)]
         return np.concatenate(values), prepared.obs_metadata

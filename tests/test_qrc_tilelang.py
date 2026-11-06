@@ -14,24 +14,33 @@ gpu = pytest.mark.skipif(
 )
 
 
-def _make_model(n_qubits=6, depth=2, seed=42):
+def _make_model(n_qubits=6, depth=2, seed=42, reservoir="rotation", time_step=0.5):
     from qulacs import Observable
     from sklearn.linear_model import LinearRegression
 
     from qreservoir.encoders import ExpEncoder
     from qreservoir.models import QELModel
-    from qreservoir.reservoirs import RotationReservoir
+    from qreservoir.reservoirs import (
+        CNOTReservoir,
+        IsingMagTraverseReservoir,
+        RotationReservoir,
+    )
 
     np.random.seed(seed)
     encoder = ExpEncoder(n_qubits, 1, 1)
-    reservoir = RotationReservoir(encoder, 0, depth)
+    factories = {
+        "rotation": lambda e: RotationReservoir(e, 0, depth),
+        "cnot": lambda e: CNOTReservoir(e, 0, depth),
+        "ising": lambda e: IsingMagTraverseReservoir(e, 0, time_step=time_step),
+    }
+    reservoir_obj = factories[reservoir](encoder)
     observables = []
     for i in range(n_qubits):
         for axis in ("Z", "X", "Y"):
             ob = Observable(n_qubits)
             ob.add_operator(1.0, f"{axis} {i}")
             observables.append(ob)
-    return QELModel(reservoir, observables, LinearRegression())
+    return QELModel(reservoir_obj, observables, LinearRegression())
 
 
 def test_gate_plan_and_missing_gpu_error():
@@ -48,11 +57,12 @@ def test_gate_plan_and_missing_gpu_error():
 
 
 @gpu
-def test_tilelang_matches_qulacs_exact():
+@pytest.mark.parametrize("reservoir", ["rotation", "cnot", "ising"])
+def test_tilelang_matches_qulacs_exact(reservoir):
     """Batched TileLang expectations agree with qreservoir within 1e-9."""
     from pqfmlib.experimental.qrc_tilelang import QRCExecutor
 
-    model = _make_model()
+    model = _make_model(reservoir=reservoir)
     rows = np.random.RandomState(7).randn(24, 6) * 0.5
     expected = model.batch_calculate_observable_expectations(rows)
     actual = QRCExecutor(model, batch_size=8).execute(rows)

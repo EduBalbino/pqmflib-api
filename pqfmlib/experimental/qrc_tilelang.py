@@ -11,9 +11,17 @@ rotations and CZ gates (e.g. ``RotationReservoir``); anything else raises
 import numpy as np
 import torch
 
+_PREPARED_CONTEXT = {}
+
 from pqfmlib.experimental.heisenberg_tilelang import apply_gate, local_expectations
 
 _CZ_MATRIX = np.diag([1.0, 1.0, 1.0, -1.0]).astype(complex)
+# CNOT with control=q0, target=q1 in the kernel's row convention
+# (row = bit(q0) + 2*bit(q1)): flips q1 when q0=1.
+_CNOT_MATRIX = np.array([[1, 0, 0, 0],
+                         [0, 0, 0, 1],
+                         [0, 0, 1, 0],
+                         [0, 1, 0, 0]], dtype=complex)
 
 
 def _gate_matrix(gate):
@@ -65,6 +73,11 @@ def build_gate_plan(model):
         controls = gate.get_control_index_list()
         if gate.get_name() == "CZ" and len(targets) == 1 and len(controls) == 1:
             plan.append((2, controls[0], targets[0], _CZ_MATRIX, None))
+        elif gate.get_name() == "CNOT" and len(targets) == 1 and len(controls) == 1:
+            plan.append((2, controls[0], targets[0], _CNOT_MATRIX, None))
+        elif gate.get_name() == "DenseMatrix" and not controls:
+            plan.append(("dense", 0, 0,
+                         np.asarray(gate.get_matrix(), dtype=complex), None))
         elif not controls and len(targets) == 1:
             plan.append((1, targets[0], 0, _gate_matrix(gate), None))
         else:
@@ -100,6 +113,14 @@ def fuse_diagonal(plan, n_qubits):
             phase = None
 
     for width, q0, q1, matrix, param in plan:
+        if width == "dense":
+            # exp(-iHt) over all qubits: one batched matmul; cannot fuse.
+            flush()
+            tensor = torch.view_as_real(
+                torch.tensor(matrix, dtype=torch.complex128, device="cuda")
+            ).contiguous()
+            steps.append(("dense", tensor))
+            continue
         if param is None and _is_diagonal(matrix):
             if phase is None:
                 phase = np.ones(size, dtype=complex)
@@ -199,6 +220,14 @@ def _apply_steps(prepared, state, angles, batch, size):
             phase_c = torch.complex(phase[:, 0], phase[:, 1])
             state = torch.view_as_real(state_c * phase_c)
             continue
+        if step[0] == "dense":
+            # exp(-iHt): out_j = sum_i U[j, i] psi_i, batched over rows.
+            unitary = torch.view_as_complex(step[1])  # (size, size)
+            state_c = torch.view_as_complex(state)  # (batch, size)
+            state = torch.view_as_real(
+                torch.matmul(unitary, state_c.unsqueeze(-1)).squeeze(-1)
+            )
+            continue
         _, width, q0, q1, tensor, param = step
         if tensor is not None:
             matrix = tensor.expand(batch, -1, -1, -1)
@@ -284,27 +313,33 @@ class QRCExecutor:
         self.plan, self.n_qubits = build_gate_plan(model)
         self.prepared = _prepare_plan(self.plan, self.n_qubits)
         self.n_observables = 3 * self.n_qubits + (2 * self.n_qubits if include_two_local else 0)
+        self._runner = None
 
     def execute(self, encoded):
-        """Expectations for encoded rows; see ``simulate_qrc_batch``."""
+        """Expectations for encoded rows; see ``simulate_qrc_batch``.
+
+        Uses one captured CUDA graph per batch (a single replay launch per
+        chunk); the final short chunk is zero-padded and sliced.
+        """
         encoded = np.asarray(encoded, dtype=float)
         if (encoded.ndim != 2 or not np.isfinite(encoded).all()
                 or encoded.shape[1] != self.model.reservoir.encoder.feature_num):
             raise ValueError("Encoded rows must be finite with encoder.feature_num columns")
-        size = 1 << self.n_qubits
+        if not len(encoded):
+            return np.empty((0, self.n_observables))
+        if self._runner is None:
+            _PREPARED_CONTEXT["prepared"] = self.prepared
+            self._runner = _GraphRunner(self.prepared, self.n_qubits, self.batch_size,
+                                        encoded.shape[1], self.include_two_local)
+            _PREPARED_CONTEXT.pop("prepared")
         outputs = []
         for start in range(0, len(encoded), self.batch_size):
-            values = encoded[start:start + self.batch_size]
-            batch = len(values)
-            angles = torch.tensor(values, dtype=torch.float64, device="cuda")
-            state = torch.zeros((batch, size, 2), dtype=torch.float64, device="cuda")
-            state[:, 0, 0] = 1.0
-            state = _apply_steps(self.prepared, state, angles, batch, size)
-            values = local_expectations(state, self.n_qubits)
-            if self.include_two_local:
-                values = torch.cat([values, two_local_expectations(state, self.n_qubits)], dim=-1)
-            outputs.append(values.cpu().numpy())
-        return np.concatenate(outputs) if outputs else np.empty((0, self.n_observables))
+            chunk = encoded[start:start + self.batch_size]
+            actual = len(chunk)
+            if actual < self.batch_size:
+                chunk = np.pad(chunk, ((0, self.batch_size - actual), (0, 0)))
+            outputs.append(self._runner.run(chunk)[:actual].cpu().numpy())
+        return np.concatenate(outputs)
 
 
 class TemporalQRCExecutor:
@@ -358,26 +393,97 @@ class TemporalQRCExecutor:
             else:
                 raise ValueError(f"Unsupported reservoir gate {gate.get_name()!r}")
         self.prepared = _prepare_plan(drive + dynamics_plan, self.n_qubits)
+        self._runner = None
 
     def execute(self, sequences):
         """Expectations per timestep for padded sequences.
 
         ``sequences``: (n_seq, max_len, n_enc) encoded inputs. Returns
-        (n_seq, max_len, 3 * n_qubits) in per-qubit Z, X, Y order.
+        (n_seq, max_len, 3 * n_qubits) in per-qubit Z, X, Y order. The
+        per-timestep gate sequence is captured once per chunk as a CUDA
+        graph; each timestep is a single replay carrying the state forward.
         """
         sequences = np.asarray(sequences, dtype=float)
         if sequences.ndim != 3 or not np.isfinite(sequences).all():
             raise ValueError("Sequences must be a finite 3D array (n_seq, max_len, n_enc)")
-        n_seq, max_len, _ = sequences.shape
-        size = 1 << self.n_qubits
+        n_seq, max_len, n_feat = sequences.shape
         out = np.empty((n_seq, max_len, 3 * self.n_qubits))
+        if self._runner is None:
+            _PREPARED_CONTEXT["prepared"] = self.prepared
+            self._runner = _GraphRunner(self.prepared, self.n_qubits, self.batch_size,
+                                        n_feat, include_two_local=False, init_state=False)
+            _PREPARED_CONTEXT.pop("prepared")
         for start in range(0, n_seq, self.batch_size):
             chunk = sequences[start:start + self.batch_size]
-            batch = len(chunk)
-            state = torch.zeros((batch, size, 2), dtype=torch.float64, device="cuda")
-            state[:, 0, 0] = 1.0
+            actual = len(chunk)
+            if actual < self.batch_size:
+                chunk = np.pad(chunk, ((0, self.batch_size - actual), (0, 0), (0, 0)))
+            self._runner.reset_state()
             for t in range(max_len):
-                angles = torch.tensor(chunk[:, t, :], dtype=torch.float64, device="cuda")
-                state = _apply_steps(self.prepared, state, angles, batch, size)
-                out[start:start + batch, t, :] = local_expectations(state, self.n_qubits).cpu().numpy()
+                values = self._runner.run(chunk[:, t, :])
+                out[start:start + actual, t, :] = values[:actual].cpu().numpy()
         return out
+
+class _GraphRunner:
+    """CUDA-graph capture of the full gate sequence for a fixed batch.
+
+    Captures init + all gate steps + expectations into one graph; replay
+    costs a single launch instead of one per gate. Input angles and output
+    expectations live in static buffers; callers copy in/out. Falls back to
+    eager execution when capture fails (e.g. non-capturable backend).
+    """
+
+    def __init__(self, prepared, n_qubits, batch_size, n_features,
+                 include_two_local, init_state=True):
+        self.batch_size = batch_size
+        self.n_qubits = n_qubits
+        self.include_two_local = include_two_local
+        self.init_state = init_state
+        self.size = 1 << n_qubits
+        self.angles = torch.zeros(batch_size, n_features, dtype=torch.float64, device="cuda")
+        self.state = torch.zeros(batch_size, self.size, 2, dtype=torch.float64, device="cuda")
+        width = 3 * n_qubits + (2 * n_qubits if include_two_local else 0)
+        self.output = torch.empty(batch_size, width, dtype=torch.float64, device="cuda")
+        self.graph = None
+        # Warmup on a side stream (required before capture).
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                self._run_eager()
+        torch.cuda.current_stream().wait_stream(stream)
+        try:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                self._run_eager()
+            self.graph = graph
+        except Exception:
+            self.graph = None
+
+    def _run_eager(self):
+        state = self.state
+        if self.init_state:
+            state.zero_()
+            state[:, 0, 0] = 1.0
+        final = _apply_steps(_PREPARED_CONTEXT["prepared"], state, self.angles,
+                             self.batch_size, self.size)
+        # Write the final state back so the next replay carries it forward
+        # (the first gate kernel always reads self.state). For init_state
+        # runners the init overwrites this on the next replay anyway.
+        self.state.copy_(final)
+        values = local_expectations(final, self.n_qubits)
+        if self.include_two_local:
+            values = torch.cat([values, two_local_expectations(final, self.n_qubits)], dim=-1)
+        self.output.copy_(values)
+
+    def reset_state(self):
+        self.state.zero_()
+        self.state[:, 0, 0] = 1.0
+
+    def run(self, angles_np):
+        self.angles.copy_(torch.from_numpy(np.ascontiguousarray(angles_np)))
+        if self.graph is not None:
+            self.graph.replay()
+        else:
+            self._run_eager()
+        return self.output

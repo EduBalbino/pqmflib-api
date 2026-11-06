@@ -85,3 +85,47 @@ def test_invalid_rows_rejected_without_gpu():
         executor.execute(np.array([[np.nan] * 6]))
     with pytest.raises(ValueError):
         executor.execute(np.zeros((2, 3)))
+
+@gpu
+def test_temporal_step1_matches_qel_with_ancilla():
+    """First temporal step equals QEL with ancilla memory at |0> (exact)."""
+    from qulacs import Observable
+    from sklearn.linear_model import LinearRegression
+
+    from qreservoir.encoders import ExpEncoder
+    from qreservoir.models import QELModel
+    from qreservoir.reservoirs import RotationReservoir
+
+    from pqfmlib.experimental.qrc_tilelang import TemporalQRCExecutor
+
+    n_enc, n_mem = 4, 6
+    np.random.seed(42)
+    encoder = ExpEncoder(n_enc, 1, 1)
+    reservoir = RotationReservoir(encoder, n_mem, 3)
+    total = n_enc + n_mem
+    observables = []
+    for i in range(total):
+        for axis in ("Z", "X", "Y"):
+            ob = Observable(total)
+            ob.add_operator(1.0, f"{axis} {i}")
+            observables.append(ob)
+    model = QELModel(reservoir, observables, LinearRegression())
+    rows = np.random.RandomState(0).randn(8, n_enc) * 0.5
+    expected = model.batch_calculate_observable_expectations(rows)
+    executor = TemporalQRCExecutor(n_enc, n_mem, depth=3, seed=42, batch_size=8)
+    actual = executor.execute(rows[:, None, :])[:, 0, :]
+    np.testing.assert_allclose(actual, expected, atol=1e-9)
+
+
+@gpu
+def test_temporal_carries_memory_and_is_deterministic():
+    """Later steps differ from step 1 (state carries over) and are stable."""
+    from pqfmlib.experimental.qrc_tilelang import TemporalQRCExecutor
+
+    executor = TemporalQRCExecutor(4, 6, depth=3, seed=42, batch_size=4)
+    seq = np.random.RandomState(1).randn(4, 5, 4) * 0.5
+    first = executor.execute(seq)
+    second = executor.execute(seq)
+    assert first.shape == (4, 5, 30)
+    np.testing.assert_array_equal(first, second)
+    assert np.abs(first[:, -1] - first[:, 0]).mean() > 0.01

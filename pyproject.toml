@@ -31,6 +31,19 @@ examples = [
 dev = [
   "pytest>=8.0",
 ]
+sia-notebook = [
+  "cuda-quantum-cu12>=0.16,<0.17",
+  "ipykernel",
+  "jupyterlab",
+  "matplotlib>=3.10.9",
+  "pyarrow",
+  "shap>=0.45",
+  "torch",
+  "tilelang>=0.1.15,<0.2",
+  "triton",
+  "qreservoir>=0.5",
+  "xgboost",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

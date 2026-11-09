@@ -139,3 +139,45 @@ def test_temporal_carries_memory_and_is_deterministic():
     assert first.shape == (4, 5, 30)
     np.testing.assert_array_equal(first, second)
     assert np.abs(first[:, -1] - first[:, 0]).mean() > 0.01
+
+
+@gpu
+def test_temporal_injection_replaces_encoding_register():
+    """Step t+1 equals dynamics applied to (fresh encoding of x_{t+1} ⊗ normalized
+    enc=0 projection of the carried state): injection, not composition."""
+    import torch
+
+    from pqfmlib.experimental.qrc_tilelang import (
+        TemporalQRCExecutor,
+        _apply_steps,
+        local_expectations,
+    )
+
+    n_enc, n_mem = 2, 2
+    total = n_enc + n_mem
+    size = 1 << total
+    executor = TemporalQRCExecutor(n_enc, n_mem, depth=2, seed=7, batch_size=1)
+    x = np.array([[[0.4, -0.7], [1.1, 0.2]]], dtype=float)  # one sequence, two steps
+    out = executor.execute(x)
+
+    # Manual reference: step 1 from |0...0> (injection is a no-op there).
+    state = torch.zeros(1, size, 2, dtype=torch.float64, device="cuda")
+    state[0, 0, 0] = 1.0
+    state = _apply_steps(executor.prepared, state,
+                         torch.tensor(x[0, :1], dtype=torch.float64, device="cuda"), 1, size)
+    np.testing.assert_allclose(local_expectations(state, total).cpu().numpy()[0],
+                               out[0, 0], atol=1e-12)
+
+    # Injection: project onto the encoding-zero sector, renormalize, re-encode.
+    keep = torch.from_numpy(
+        ((np.arange(size) & ((1 << n_enc) - 1)) == 0).astype(np.float64)).to("cuda")
+    carried = torch.view_as_complex(state) * keep
+    norm2 = (carried.abs() ** 2).sum(dim=1)
+    assert (norm2 > 0).all(), "enc=0 sector must retain probability"
+    carried = carried / torch.sqrt(norm2).unsqueeze(1)
+    state = torch.view_as_real(carried).contiguous()
+    state = _apply_steps(executor.prepared, state,
+                         torch.tensor(x[0, 1:], dtype=torch.float64, device="cuda"),
+                         1, size)
+    np.testing.assert_allclose(local_expectations(state, total).cpu().numpy()[0],
+                               out[0, 1], atol=1e-12)

@@ -343,17 +343,22 @@ class QRCExecutor:
 
 
 class TemporalQRCExecutor:
-    """Sequential pure-state quantum reservoir over batched sequences.
+    """Sequential reservoir with input injection over batched sequences (TileLang/GPU).
 
-    Architecture (input-driven QRC, TileLang/GPU): total qubits split into
-    ``n_enc`` encoding qubits and ``n_mem`` memory qubits. Each timestep,
-    encoding rotations RotX(input) are applied to the encoding qubits of the
-    carried state, then fixed reservoir dynamics (random rotations + CZ
-    ring, same construction as qreservoir ``RotationReservoir``) evolve the
-    full state. Expectations are read after dynamics at every timestep.
-    This differs from qreservoir ``RCModel`` (density matrices + partial
-    trace over encoding qubits); here the pure state carries memory, which
-    keeps the computation exactly statevector-simulable on GPU.
+    Architecture: total qubits split into ``n_enc`` encoding qubits and
+    ``n_mem`` memory qubits. Each timestep the encoding register is
+    replaced: the carried state is projected onto the encoding-zero sector
+    and renormalized (the pure-state surrogate of the partial trace in
+    density-matrix reservoir computing), the fresh input is written by
+    RotX rotations on the encoding qubits, and fixed reservoir dynamics
+    (random rotations + CZ ring, same construction as qreservoir's
+    ``RotationReservoir``) evolve the full register. Expectations are read
+    after dynamics at every timestep. Past inputs persist only through the
+    memory qubits, with a controlled washout, instead of persisting
+    scrambled across the whole register as in drive-on-carried-state
+    composition. The projection surrogate keeps the computation an exact
+    statevector simulation on GPU; it approximates the density-matrix
+    model by dropping coherences between encoding sectors.
     """
 
     precision = "double"
@@ -411,7 +416,8 @@ class TemporalQRCExecutor:
         if self._runner is None:
             _PREPARED_CONTEXT["prepared"] = self.prepared
             self._runner = _GraphRunner(self.prepared, self.n_qubits, self.batch_size,
-                                        n_feat, include_two_local=False, init_state=False)
+                                        n_feat, include_two_local=False, init_state=False,
+                                        injection=True, n_enc=self.n_enc)
             _PREPARED_CONTEXT.pop("prepared")
         for start in range(0, n_seq, self.batch_size):
             chunk = sequences[start:start + self.batch_size]
@@ -434,12 +440,20 @@ class _GraphRunner:
     """
 
     def __init__(self, prepared, n_qubits, batch_size, n_features,
-                 include_two_local, init_state=True):
+                 include_two_local, init_state=True, injection=False,
+                 n_enc=None):
         self.batch_size = batch_size
         self.n_qubits = n_qubits
         self.include_two_local = include_two_local
         self.init_state = init_state
+        self.injection = injection
         self.size = 1 << n_qubits
+        if injection:
+            enc_mask = (1 << n_enc) - 1
+            keep = ((np.arange(self.size) & enc_mask) == 0).astype(np.float64)
+            self.enc_keep = torch.from_numpy(keep).to("cuda")
+        else:
+            self.enc_keep = None
         self.angles = torch.zeros(batch_size, n_features, dtype=torch.float64, device="cuda")
         self.state = torch.zeros(batch_size, self.size, 2, dtype=torch.float64, device="cuda")
         width = 3 * n_qubits + (2 * n_qubits if include_two_local else 0)
@@ -462,6 +476,17 @@ class _GraphRunner:
 
     def _run_eager(self):
         state = self.state
+        if self.injection:
+            # Injection: project the carried state onto the encoding-zero
+            # sector and renormalize (pure-state surrogate of tracing out
+            # the encoding register), so the drive writes x_t into a fresh
+            # encoding register. Inside the captured graph; static shapes.
+            state_c = torch.view_as_complex(state) * self.enc_keep
+            norm2 = (state_c.abs() ** 2).sum(dim=1)
+            norm = torch.sqrt(torch.where(norm2 > 0, norm2, torch.ones_like(norm2)))
+            state = torch.view_as_real(state_c / norm.unsqueeze(1))
+            self.state.copy_(state)
+            state = self.state
         if self.init_state:
             state.zero_()
             state[:, 0, 0] = 1.0

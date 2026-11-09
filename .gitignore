@@ -32,6 +32,7 @@ tests/*
 !tests/test_cudaq_execution.py
 !tests/test_statevector_execution.py
 !tests/test_xyz_shap_notebook.py
+!tests/test_qrc_tilelang.py
 results/
 backup/
 output/
@@ -48,6 +49,9 @@ data/
 *.ipynb
 !experiments/sia/QIMED_MoE_Demanda_Pressao_pqfmlib_api.ipynb
 experiments/*
+!experiments/sia/
+experiments/sia/*
+!experiments/sia/QIMED_MoE_Demanda_Pressao_qreservoir_QRC.ipynb
 !examples/*.ipynb
 dataset_exploration.ipynb
 tutorial/

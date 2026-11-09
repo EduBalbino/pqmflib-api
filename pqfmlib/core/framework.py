@@ -4,8 +4,8 @@ from __future__ import annotations
 
 
 def validate_framework(framework: str) -> None:
-    if framework not in ("qiskit", "cudaq"):
-        raise ValueError("framework must be 'qiskit' or 'cudaq'.")
+    if framework not in ("qiskit", "cudaq", "tilelang"):
+        raise ValueError("framework must be 'qiskit', 'cudaq' or 'tilelang'.")
 
 
 def validate_precision(precision: str) -> None:
@@ -29,9 +29,9 @@ def validate_framework_configuration(
 ) -> None:
     """Check CUDA-Q restrictions before legacy ideal-mode normalization."""
     validate_framework(framework)
-    if framework == "cudaq" and (not simulation or not ideal or fakebackend):
+    if framework in ("cudaq", "tilelang") and (not simulation or not ideal or fakebackend):
         raise ValueError(
-            "framework='cudaq' requires simulation=True, ideal=True and "
+            f"framework='{framework}' requires simulation=True, ideal=True and "
             "fakebackend=False; non-ideal simulation, fake backends and QPU "
             "execution are not supported."
         )
